@@ -1,0 +1,10 @@
+{
+  "name": "@jarvis/skill-learner",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "index.js",
+  "description": "Auto-learn reusable skills from complex agent sessions via OpenClaw hooks",
+  "openclaw": {
+    "extensions": ["./index.js"]
+  }
+}

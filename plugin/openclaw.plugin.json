@@ -1,0 +1,19 @@
+{
+  "name": "@jarvis/skill-learner",
+  "version": "1.0.0",
+  "description": "Auto-learn reusable skills from complex agent sessions",
+  "openclaw": {
+    "extensions": [
+      "./index.js"
+    ],
+    "compat": {
+      "pluginApi": ">=2026.3.0"
+    }
+  },
+  "id": "jarvis-skill-learner",
+  "configSchema": {
+    "type": "object",
+    "properties": {},
+    "additionalProperties": false
+  }
+}
