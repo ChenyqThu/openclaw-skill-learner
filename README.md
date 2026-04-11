@@ -162,7 +162,7 @@ For the full research report comparing Hermes and OpenClaw architectures, see th
 
 ## Morning Report Integration
 
-If you use an OpenClaw morning report system, the plugin writes `.pending-review.json` which can be consumed by your report card builder. See the [project documentation](https://te3ozb67sn.feishu.cn/wiki/PLACEHOLDER) for integration details.
+If you use an OpenClaw morning report system, the plugin writes `.pending-review.json` which can be consumed by your report card builder. See the [project documentation](https://www.feishu.cn/wiki/OqW8wQhj6iJbZnkbMxWcNzLgnlb) for integration details.
 
 ## License
 
