@@ -17,6 +17,7 @@ Design:
 """
 
 import json
+import base64
 import os
 import sys
 import time
@@ -127,42 +128,244 @@ def write_queue_file(body: dict) -> str:
     return request_id
 
 # ─── Feishu Notification ──────────────────────────────────────────────────────
-def send_feishu_notification(skill_name: str, action: str, tool_count: int,
-                              agent_id: str, session_key: str):
-    """
-    Send a Feishu DM to Lucien with Skill update candidate info.
-    Uses openclaw message send CLI (fire-and-forget via subprocess).
-    """
-    action_label = "新建" if action == "create" else "更新"
-    short_session = session_key.split(":")[-1][:20] if session_key else "unknown"
-
-    message = (
-        f"🧠 Skill 更新候选\n"
-        f"名称: {skill_name}\n"
-        f"动作: {action_label}\n"
-        f"工具调用: {tool_count} 次\n"
-        f"来源: {agent_id} / {session_key}\n\n"
-        f"回复「通过 {skill_name}」落地此 Skill，或「跳过」忽略"
+def _get_feishu_token() -> str | None:
+    """Fetch tenant_access_token from Feishu API using app credentials."""
+    import urllib.request as ureq
+    app_id = os.environ.get("FEISHU_APP_ID")
+    app_secret = os.environ.get("FEISHU_APP_SECRET")
+    if not app_id or not app_secret:
+        log.warning("FEISHU_APP_ID or FEISHU_APP_SECRET not set")
+        return None
+    payload = json.dumps({"app_id": app_id, "app_secret": app_secret}).encode()
+    req = ureq.Request(
+        "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
+        data=payload,
+        headers={"Content-Type": "application/json"},
     )
+    try:
+        with ureq.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+            return data.get("tenant_access_token")
+    except Exception as e:
+        log.warning(f"Failed to get Feishu token: {e}")
+        return None
 
+
+def _load_eval_data(skill_name: str, action: str) -> dict:
+    """
+    Load .eval.json for a skill candidate.
+    For new skills: ~/.openclaw/workspace/skills/auto-learned/{name}/.eval.json
+    For updates: scan all skills dirs for {name}/.eval.json
+    Returns dict with eval fields (empty dict if not found).
+    """
+    from pathlib import Path as P
+    if action == "create":
+        p = P.home() / f".openclaw/workspace/skills/auto-learned/{skill_name}/.eval.json"
+        if p.exists():
+            try:
+                return json.loads(p.read_text())
+            except Exception:
+                pass
+        return {}
+    else:
+        all_skills_dir = P.home() / ".openclaw/workspace/skills"
+        for skill_md in all_skills_dir.rglob("SKILL.md"):
+            if skill_md.parent.name == skill_name:
+                p = skill_md.parent / ".eval.json"
+                if p.exists():
+                    try:
+                        return json.loads(p.read_text())
+                    except Exception:
+                        pass
+        return {}
+
+
+def send_feishu_notification(skill_name: str, action: str, tool_count: int,
+                              agent_id: str, session_key: str,
+                              last_inbound_message_id: str | None = None):
+    """
+    Send a Feishu interactive card DM to Lucien.
+    Card: header with skill name, rich eval content, collapsed session details,
+    three action buttons (approve / discuss / skip) + optimization input form.
+    Replies to last_inbound_message_id if available.
+    """
+    import urllib.request as ureq
+
+    action_label = "新建" if action == "create" else "更新"
+    header_color = "orange" if action == "create" else "blue"
+
+    # ── Load structured eval data ──────────────────────────────────────────────
+    ev = _load_eval_data(skill_name, action)
+    problem_context = ev.get("problem_context") or ev.get("problem") or "（Gemini 未返回结构化评估，请查阅草稿文件）"
+    recommended_approach = ev.get("recommended_approach") or ev.get("approach") or ""
+    when_to_use = ev.get("when_to_use") or []
+    key_patterns = ev.get("key_patterns") or []
+    pitfalls = ev.get("pitfalls") or ev.get("new_pitfalls") or []
+    tool_names = ev.get("toolNames") or []
+
+    def fmt_list(items, max_n=5):
+        if not items:
+            return "暂无"
+        return "\n".join(f"- {i}" for i in items[:max_n])
+
+    short_session = session_key.split(":")[-1][:40] if session_key else "unknown"
+    tool_names_str = ", ".join(tool_names[:8]) if tool_names else "暂无"
+
+    main_content_lines = []
+    if problem_context:
+        main_content_lines.append(f"🔍 **问题发现**\n{problem_context}")
+    if recommended_approach:
+        main_content_lines.append(f"💡 **推荐方案**\n{recommended_approach}")
+    main_content = "\n\n".join(main_content_lines) if main_content_lines else "（评估内容较少，请查阅草稿）"
+
+    when_content = fmt_list(when_to_use, 5) if when_to_use else "请查阅 SKILL.md"
+    patterns_and_pitfalls = ""
+    if key_patterns:
+        patterns_and_pitfalls += f"**关键模式**\n{fmt_list(key_patterns, 4)}\n\n"
+    if pitfalls:
+        patterns_and_pitfalls += f"**已知雷区**\n{fmt_list(pitfalls, 4)}"
+
+    detail_content = f"**来源**：{agent_id}\n**Session**：`{short_session}`\n**工具涉及**：{tool_count} 次\n**工具列表**：{tool_names_str}"
+
+    # ── Build Card JSON (2.0) ───────────────────────────────────────────────────
+    body_elements = [
+        {"tag": "markdown", "content": main_content},
+        {"tag": "markdown", "content": f"📋 **适用场景**\n{when_content}"},
+    ]
+    if patterns_and_pitfalls.strip():
+        body_elements.append({"tag": "markdown", "content": patterns_and_pitfalls.strip()})
+
+    # Collapsed session details (grey panel, OUTSIDE form — collapsible_panel cannot nest in form)
+    body_elements.append({
+        "tag": "collapsible_panel",
+        "expanded": False,
+        "background_color": "grey-50",
+        "header": {
+            "title": {"tag": "markdown", "content": "📎 **来源 & Session 详情**"},
+            "background_color": "grey-100",
+        },
+        "border": {"color": "grey-200", "corner_radius": "8px"},
+        "elements": [{"tag": "markdown", "content": detail_content, "text_size": "notation"}],
+    })
+
+    # Form with input + 3 buttons (Card 2.0)
+    # Buttons use width="auto" for left-aligned natural sizing (not stretched)
+    body_elements.append({
+        "tag": "form",
+        "name": "skill_action_form",
+        "elements": [
+            {
+                "tag": "input",
+                "name": "optimization_note",
+                "input_type": "multiline_text",
+                "label": {"tag": "plain_text", "content": "💬 优化建议（可选，点击「方案优化讨论」时带给 Jarvis）"},
+                "label_position": "top",
+                "placeholder": {"tag": "plain_text", "content": "输入优化建议，或对该 Skill 的想法..."},
+                "rows": 3, "auto_resize": True, "max_rows": 10,
+                "width": "fill",
+            },
+            # Metadata encoded in button name: "verb||base64(skill_name)||action"
+            # Avoids disabled-but-visible hidden input; decoded in card_action callback
+            {
+                "tag": "column_set", "flex_mode": "none",
+                "columns": [
+                    {"tag": "column", "width": "auto", "elements": [{
+                        "tag": "button", "type": "primary",
+                        "name": f"approve||{base64.urlsafe_b64encode(skill_name.encode()).decode().rstrip('=')}||{action}",
+                        "form_action_type": "submit",
+                        "text": {"tag": "plain_text", "content": "✅ 通过落地"},
+                        "confirm": {"title": {"tag": "plain_text", "content": "确认落地此 Skill？"},
+                                    "text": {"tag": "plain_text", "content": f"将把「{skill_name}」从草稿移入正式 skills 目录"}},
+                    }]},
+                    {"tag": "column", "width": "auto", "elements": [{
+                        "tag": "button", "type": "default",
+                        "name": f"discuss||{base64.urlsafe_b64encode(skill_name.encode()).decode().rstrip('=')}||{action}",
+                        "form_action_type": "submit",
+                        "text": {"tag": "plain_text", "content": "💬 方案优化讨论"},
+                    }]},
+                    {"tag": "column", "width": "auto", "elements": [{
+                        "tag": "button", "type": "danger",
+                        "name": f"skip||{base64.urlsafe_b64encode(skill_name.encode()).decode().rstrip('=')}||{action}",
+                        "form_action_type": "submit",
+                        "text": {"tag": "plain_text", "content": "⏭ 跳过"},
+                        "confirm": {"title": {"tag": "plain_text", "content": "确认跳过？"},
+                                    "text": {"tag": "plain_text", "content": "将删除此 Skill 草稿，不可恢复"}},
+                    }]},
+                ],
+            },
+        ],
+    })
+
+    card = {
+        "schema": "2.0",
+        "config": {"width_mode": "fill"},
+        "header": {
+            "title": {"content": f"🧠 Skill 候选 · {action_label} · {skill_name}", "tag": "plain_text"},
+            "template": header_color,
+        },
+        "body": {
+            "direction": "vertical",
+            "vertical_spacing": "8px",
+            "elements": body_elements,
+        },
+    }
+    # ── Send via Feishu API ─────────────────────────────────────────────────────
+    token = _get_feishu_token()
+    if not token:
+        log.warning("No Feishu token, falling back to plain text notification")
+        _send_feishu_plain_fallback(skill_name, action_label, tool_count, agent_id, session_key)
+        return
+
+    msg_body: dict = {
+        "msg_type": "interactive",
+        "content": json.dumps(card),
+    }
+    if last_inbound_message_id:
+        url = f"https://open.feishu.cn/open-apis/im/v1/messages/{last_inbound_message_id}/reply"
+        msg_body["reply_in_thread"] = False
+        log.info(f"Replying to message {last_inbound_message_id}")
+    else:
+        url = "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=open_id"
+        msg_body["receive_id"] = "ou_8d1ce0fa1d435070ed695baeabe25adc"
+        log.info("Sending as new DM (no inbound message id available)")
+
+    payload = json.dumps(msg_body).encode()
+    req = ureq.Request(
+        url, data=payload,
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+    )
+    try:
+        with ureq.urlopen(req, timeout=15) as resp:
+            result = json.loads(resp.read())
+            if result.get("code") == 0:
+                log.info(f"Feishu card sent for skill: {skill_name} ({action_label})")
+            else:
+                log.warning(f"Feishu card send failed (code={result.get('code')}): {result.get('msg')}")
+                _send_feishu_plain_fallback(skill_name, action_label, tool_count, agent_id, session_key)
+    except Exception as e:
+        log.warning(f"Feishu card send exception: {e}")
+        _send_feishu_plain_fallback(skill_name, action_label, tool_count, agent_id, session_key)
+
+def _send_feishu_plain_fallback(skill_name: str, action_label: str, tool_count: int,
+                                 agent_id: str, session_key: str):
+    """Fallback: send plain text via openclaw CLI if card send fails."""
+    message = (
+        f"🧠 Skill 候选（{action_label}）\n"
+        f"名称: {skill_name}\n"
+        f"工具调用: {tool_count} 次 | 来源: {agent_id}\n\n"
+        f"回复「通过 {skill_name}」落地，或「跳过」忽略"
+    )
     cmd = [
         "openclaw", "message", "send",
         "--channel", "feishu",
         "--target", "user:ou_8d1ce0fa1d435070ed695baeabe25adc",
         "--message", message,
     ]
-
     try:
-        # Fire and forget — don't block the response
-        subprocess.Popen(
-            cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
-        )
-        log.info(f"Feishu notification fired for skill: {skill_name} ({action_label})")
+        subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        log.info(f"Fallback plain text sent for skill: {skill_name}")
     except Exception as e:
-        log.warning(f"Feishu notification failed: {e}")
+        log.warning(f"Fallback notification failed: {e}")
 
 # ─── Core Evaluate Handler ─────────────────────────────────────────────────────
 def handle_evaluate(body: dict) -> dict:
@@ -229,10 +432,11 @@ def handle_evaluate(body: dict) -> dict:
                     tool_count = item.get("toolCount", body.get("toolCount", 0))
                     agent_id = body.get("agentId", "jarvis")
                     session_key = body.get("sessionKey", "")
+                    last_msg_id = item.get("lastInboundMessageId") or body.get("lastInboundMessageId")
                     # Send Feishu notification in background thread
                     threading.Thread(
                         target=send_feishu_notification,
-                        args=(skill_name, action, tool_count, agent_id, session_key),
+                        args=(skill_name, action, tool_count, agent_id, session_key, last_msg_id),
                         daemon=True,
                     ).start()
         except Exception as e:

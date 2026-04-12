@@ -110,6 +110,7 @@ function extractFromMessages(messages) {
   const userMessages = [];
   const assistantTexts = [];
   const toolCallNames = [];
+  let lastInboundMessageId = null; // feishu om_xxx extracted from System: header
 
   for (const msg of messages) {
     const role = msg?.role;
@@ -121,7 +122,13 @@ function extractFromMessages(messages) {
         : Array.isArray(content) ? content.map(b => b?.text || "").join(" ")
         : "";
       if (!text) continue;
-      if (text.startsWith("System:") || text.includes("HEARTBEAT")) continue;
+      if (text.includes("HEARTBEAT")) continue;
+      // Extract feishu message id from System header: [msg:om_xxx]
+      if (text.startsWith("System:")) {
+        const midMatch = text.match(/\[msg:(om_[^,\]\s]+)\]/);
+        if (midMatch) lastInboundMessageId = midMatch[1];
+        continue; // skip system headers from userMessages
+      }
       userMessages.push(text.slice(0, 500));
     } else if (role === "assistant") {
       const blocks = Array.isArray(content) ? content : [];
@@ -145,6 +152,7 @@ function extractFromMessages(messages) {
     toolNames: [...new Set(toolCallNames)],
     userMessages: userMessages.slice(0, 8),
     assistantTexts: assistantTexts.slice(0, 8),
+    lastInboundMessageId,
   };
 }
 
@@ -394,6 +402,7 @@ export default definePluginEntry({
         skillsUsed: [...new Set(usedSkills)],
         userMessages: summary?.userMessages || [],
         assistantTexts: summary?.assistantTexts || [],
+        lastInboundMessageId: summary?.lastInboundMessageId || null,
         timestamp: new Date().toISOString(),
       };
 
