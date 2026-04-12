@@ -84,6 +84,9 @@ def fetch_calendar_data():
         })
         
         import urllib.request
+        # NOTE: Using urllib + Notion-Version 2022-06-28 instead of ntn CLI.
+        # ntn CLI uses Notion API v2026-03-11 which returns 400 on this DB.
+        # Same approach as morning report (晨报) for maximum stability.
         notion_token = os.environ.get("MAILAGENT_NOTION_TOKEN", "")
         if not notion_token:
             log("  ⚠️ MAILAGENT_NOTION_TOKEN not set, skipping calendar")
