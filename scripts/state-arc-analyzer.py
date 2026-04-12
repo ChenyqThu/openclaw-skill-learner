@@ -83,32 +83,32 @@ def fetch_calendar_data():
             ]
         })
         
-        import urllib.request
-        # NOTE: Using urllib + Notion-Version 2022-06-28 instead of ntn CLI.
-        # ntn CLI uses Notion API v2026-03-11 which returns 400 on this DB.
-        # Same approach as morning report (晨报) for maximum stability.
+        # Use ntn CLI with --notion-version 2022-06-28
+        # (default 2026-03-11 returns 400 on this DB; pinned until Notion fixes)
         notion_token = os.environ.get("MAILAGENT_NOTION_TOKEN", "")
         if not notion_token:
             log("  ⚠️ MAILAGENT_NOTION_TOKEN not set, skipping calendar")
             return None
         
-        body = json.dumps({
+        query_body = json.dumps({
             "filter": json.loads(filter_payload),
             "sorts": [{"property": "Time", "direction": "ascending"}],
             "page_size": 100
-        }).encode()
-        url = f"https://api.notion.com/v1/databases/{NOTION_CALENDAR_DB}/query"
-        req = urllib.request.Request(url, data=body, headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {notion_token}",
-            "Notion-Version": "2022-06-28",
         })
-        try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                data = json.loads(resp.read())
-        except Exception as e:
-            log(f"  ⚠️ Notion query failed: {e}")
+        
+        env = {**os.environ, "NOTION_API_TOKEN": notion_token}
+        result = subprocess.run(
+            ["ntn", "api", "--notion-version", "2022-06-28",
+             f"/v1/databases/{NOTION_CALENDAR_DB}/query",
+             "-d", query_body],
+            capture_output=True, text=True, timeout=30, env=env
+        )
+        
+        if result.returncode != 0:
+            log(f"  ⚠️ ntn query failed: {result.stderr[:200]}")
             return None
+        
+        data = json.loads(result.stdout)
         events = data.get("results", [])
         
         meetings = 0
