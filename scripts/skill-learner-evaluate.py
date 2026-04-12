@@ -20,7 +20,7 @@ QUEUE_DIR = Path.home() / ".openclaw/workspace/data/skill-learner/analysis-queue
 SKILLS_DIR = Path.home() / ".openclaw/workspace/skills/auto-learned"
 ALL_SKILLS_DIR = Path.home() / ".openclaw/workspace/skills"
 PENDING_REVIEW = SKILLS_DIR / ".pending-review.json"
-GEMINI_MODEL = "gemini-3.1-flash-lite-preview"
+GEMINI_MODEL = "gemini-2.5-flash-preview-04-17"  # upgraded from flash-lite for better judgment
 
 DRY_RUN = "--dry-run" in sys.argv
 
@@ -153,12 +153,36 @@ def find_related_skill(request: dict, existing_skills: dict) -> tuple:
 
 # ─── Prompt Builders ─────────────────────────────────────────────────────────
 
+def get_existing_skills_summary() -> str:
+    """Return a compact summary of installed skills for dedup context."""
+    summary_lines = []
+    for skill_md in ALL_SKILLS_DIR.rglob("SKILL.md"):
+        if "/auto-learned/" in str(skill_md):
+            continue
+        try:
+            text = skill_md.read_text()[:1000]
+            name = skill_md.parent.name
+            desc = ""
+            import re
+            fm = re.search(r"^---\s*\n(.*?)\n---", text, re.DOTALL | re.MULTILINE)
+            if fm:
+                dm = re.search(r"description:\s*(.+)", fm.group(1))
+                if dm:
+                    desc = dm.group(1).strip().strip('"\'\')[:100]
+            if desc:
+                summary_lines.append(f"- {name}: {desc}")
+        except Exception:
+            continue
+    return "\n".join(summary_lines[:40]) if summary_lines else "(none)"
+
+
 def build_new_skill_prompt(request: dict) -> str:
     tool_info = f"{request['toolCount']} calls ({', '.join(request.get('toolNames', [])[:10])})"
     user_msgs = "\n".join(f"{i+1}. {m}" for i, m in enumerate(request.get("userMessages", [])))
     asst_msgs = "\n".join(f"{i+1}. {t}" for i, t in enumerate(request.get("assistantTexts", [])))
+    existing = get_existing_skills_summary()
 
-    return f"""Analyze this AI agent session for reusable workflow patterns.
+    return f"""You are evaluating an AI agent session to decide if a reusable Skill should be created.
 
 SESSION: {tool_info}
 
@@ -168,36 +192,44 @@ USER REQUESTS:
 AGENT RESPONSES:
 {asst_msgs}
 
-WHAT IS AN OPENCLAW SKILL (read carefully before judging):
-A Skill is a reusable *agent behavioral pattern* — it tells Jarvis HOW to approach a class of tasks.
-A Skill is NOT: a code fix to a specific script, a one-time optimization, implementation details of
-one cron job/file, or general programming advice. The key test: "If Jarvis encounters a DIFFERENT
-but structurally similar challenge next month, would this Skill guide the approach?" If the pattern
-only applies to ONE specific script or file, it should be fixed directly, not turned into a Skill.
+EXISTING SKILLS (do NOT create a skill that duplicates these):
+{existing}
 
-CRITERIA (need ALL of 1+2, plus at least one of 3-4):
-1. Reusable across at least 2-3 DIFFERENT future contexts (not just the one script in this session)?
-2. About Jarvis's tool usage/workflow patterns (not just "this specific cron job needs better error handling")?
-3. Contains non-obvious tool combos, parameter patterns, or pitfalls worth documenting for future reference?
-4. Corrects a recurring agent mistake that Jarvis would likely repeat without this guidance?
+━━━ WHAT IS AN OPENCLAW SKILL ━━━
+A Skill is a reusable *agent behavioral pattern* — a guide for HOW Jarvis should approach
+a class of tasks in the future. It is NOT: a code fix for one specific script, a one-time
+optimization, or general programming advice.
 
-Red flags — output NO_SKILL if any apply:
-- The improvement is "add error handling / retry logic to script X" (fix the script, not a new Skill)
-- The pattern is already obvious or well-covered by existing tools/docs
-- The session was debugging one specific file or config
+Core test (from Hermes): "Did this session require trial and error, changing course due to
+experiential findings, or did the user correct the agent's approach?" If yes → strong Skill candidate.
 
-If criteria NOT met: output exactly: NO_SKILL
+━━━ QUALIFICATION CRITERIA ━━━
+Need ALL of (A) + (B), plus at least one of (C)–(E):
 
-If criteria MET: output a JSON block followed by the SKILL.md content, exactly in this format:
+A. The pattern is reusable across ≥2 DIFFERENT future contexts (not just this one script/file)
+B. It's about Jarvis's tool usage or workflow orchestration — not "fix script X"
+C. Required non-obvious trial and error or course correction to discover
+D. Contains specific tool combos, parameters, or pitfalls worth documenting
+E. The user corrected the agent's method — Jarvis would repeat the mistake without this
+
+━━━ RED FLAGS → output NO_SKILL ━━━
+• Improvement is "add error handling/retry to script X" → fix the script directly
+• Pattern only applies to one specific file/cron/config
+• The approach is obvious or already covered by an existing skill above
+• toolCount < 8 and no user correction
+
+If NOT qualified: output exactly: NO_SKILL
+
+If qualified: output BOTH blocks below, in order:
 
 ```eval_json
 {{
-  "skill_name": "<concise kebab-case or Title Case name>",
-  "problem_context": "<1-2 sentences: what problem or gap this session was solving, why it matters>",
-  "recommended_approach": "<2-4 sentences: the key insight or approach discovered, what makes it work well>",
+  "skill_name": "<concise Title Case name>",
+  "problem_context": "<1-2 sentences: what recurring challenge this solves, why non-obvious>",
+  "recommended_approach": "<2-4 sentences: the key insight, what makes it work, when to apply it>",
   "when_to_use": ["<scenario 1>", "<scenario 2>", "<scenario 3>"],
-  "key_patterns": ["<specific tool combo or param pattern 1>", "<pattern 2>"],
-  "pitfalls": ["<pitfall or gotcha 1>", "<pitfall 2>"]
+  "key_patterns": ["<specific tool combo or param 1>", "<pattern 2>"],
+  "pitfalls": ["<pitfall 1>", "<pitfall 2>"]
 }}
 ```
 
@@ -229,13 +261,11 @@ def build_update_skill_prompt(request: dict, skill_name: str, skill_content: str
     tool_info = f"{request['toolCount']} calls ({', '.join(request.get('toolNames', [])[:10])})"
     user_msgs = "\n".join(f"{i+1}. {m}" for i, m in enumerate(request.get("userMessages", [])))
     asst_msgs = "\n".join(f"{i+1}. {t}" for i, t in enumerate(request.get("assistantTexts", [])))
-
-    # Truncate existing skill to save tokens
     truncated_skill = skill_content[:3000]
 
-    return f"""An AI agent used the skill "{skill_name}" during this session. Analyze whether the session revealed NEW information that should update the skill.
+    return f"""You are evaluating whether a session revealed new information to UPDATE an existing Skill.
 
-EXISTING SKILL (truncated):
+EXISTING SKILL "{skill_name}" (truncated):
 {truncated_skill}
 
 SESSION: {tool_info}
@@ -246,21 +276,22 @@ USER REQUESTS:
 AGENT RESPONSES:
 {asst_msgs}
 
-EVALUATION CRITERIA (need ≥1 to qualify for update):
-1. Were there pitfalls/errors NOT covered by the existing skill?
-2. Did the agent discover a better or faster approach?
-3. Did the user correct the agent's method or flag a gap?
+━━━ EVALUATION CRITERIA (Hermes-inspired) ━━━
+Did this session reveal something NOT covered by the existing skill? Look for:
+1. A pitfall or error the agent hit that the skill didn't warn about
+2. A better/faster approach than what the skill describes (discovered via trial and error)
+3. The user corrected the agent's method — indicating a gap in the skill's guidance
 
-If NO updates needed: output exactly: NO_UPDATE
+If NONE of these apply: output exactly: NO_UPDATE
 
-If update is warranted: output a JSON block followed by the patch YAML, exactly in this format:
+If update is warranted: output BOTH blocks below:
 
 ```eval_json
 {{
   "skill_name": "{skill_name}",
-  "problem_context": "<1-2 sentences: what new gap or problem was discovered in this session>",
-  "recommended_approach": "<2-3 sentences: the better approach or fix found, and why it's an improvement>",
-  "when_to_use": ["<updated scenario 1>", "<updated scenario 2>"],
+  "problem_context": "<what new gap was discovered in this session>",
+  "recommended_approach": "<the better approach or fix, and why it's an improvement>",
+  "when_to_use": ["<updated scenario if any>"],
   "new_pitfalls": ["<new pitfall 1>", "<new pitfall 2>"],
   "key_changes": ["<what changes and why>"]
 }}
@@ -277,7 +308,6 @@ sections_to_add:
   notes:
     - "New finding: ..."
 ```"""
-
 
 # ─── Processing ──────────────────────────────────────────────────────────────
 
@@ -306,6 +336,19 @@ def process_queue():
 
         print(f"─── {req_file.name} ───")
         print(f"  Tools: {request['toolCount']} ({', '.join(request.get('toolNames', [])[:6])})")
+
+        # Pre-filter: skip sessions with too few tool calls (optimization #3)
+        # Low-complexity sessions almost never yield reusable Skills
+        tool_count = request.get("toolCount", 0)
+        has_user_correction = any(
+            any(kw in m.lower() for kw in ["不对", "不是", "错了", "应该", "重新", "no,", "actually", "wait", "wrong", "instead"])
+            for m in request.get("userMessages", [])
+        )
+        if tool_count < 8 and not has_user_correction:
+            print(f"  ⏭️ Pre-filter: toolCount={tool_count} < 8, no user correction → skip Gemini call")
+            request["status"] = "pre_filtered"
+            req_file.write_text(json.dumps(request, indent=2))
+            continue
 
         # Check if session actually USED an existing skill (precise signal from hook)
         # Fall back to topic-overlap heuristic if no hook data
