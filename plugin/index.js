@@ -129,7 +129,7 @@ function extractFromMessages(messages) {
         if (midMatch) lastInboundMessageId = midMatch[1];
         continue; // skip system headers from userMessages
       }
-      userMessages.push(text.slice(0, 500));
+      userMessages.push(text.slice(0, 1000));
     } else if (role === "assistant") {
       const blocks = Array.isArray(content) ? content : [];
       for (const block of blocks) {
@@ -137,12 +137,12 @@ function extractFromMessages(messages) {
         if (block.type === "toolCall" || block.type === "tool_use") {
           toolCallNames.push(block.name || block.tool_name || "unknown");
         } else if (block.type === "text" && block.text) {
-          assistantTexts.push(block.text.slice(0, 300));
+          assistantTexts.push(block.text.slice(0, 500));
         }
       }
       // Handle plain string content from assistant
       if (typeof content === "string" && content.trim()) {
-        assistantTexts.push(content.slice(0, 300));
+        assistantTexts.push(content.slice(0, 500));
       }
     }
   }
@@ -150,8 +150,8 @@ function extractFromMessages(messages) {
   return {
     toolCount: toolCallNames.length,
     toolNames: [...new Set(toolCallNames)],
-    userMessages: userMessages.slice(0, 8),
-    assistantTexts: assistantTexts.slice(0, 8),
+    userMessages: userMessages.slice(0, 12),
+    assistantTexts: assistantTexts.slice(0, 12),
     lastInboundMessageId,
   };
 }
@@ -175,13 +175,13 @@ async function extractSessionSummary(sessionFile) {
         const msgContent = msg.content;
         if (role === "user" && typeof msgContent === "string") {
           if (msgContent.startsWith("System:") || msgContent.includes("HEARTBEAT")) continue;
-          userMessages.push(msgContent.slice(0, 500));
+          userMessages.push(msgContent.slice(0, 1000));
         } else if (role === "assistant" && Array.isArray(msgContent)) {
           for (const block of msgContent) {
             if (block?.type === "toolCall") {
               toolCallNames.push(block.name || "unknown");
             } else if (block?.type === "text" && block.text) {
-              assistantTexts.push(block.text.slice(0, 300));
+              assistantTexts.push(block.text.slice(0, 500));
             }
           }
         }
@@ -190,8 +190,8 @@ async function extractSessionSummary(sessionFile) {
     return {
       toolCount: toolCallNames.length,
       toolNames: [...new Set(toolCallNames)],
-      userMessages: userMessages.slice(0, 8),
-      assistantTexts: assistantTexts.slice(0, 8),
+      userMessages: userMessages.slice(0, 12),
+      assistantTexts: assistantTexts.slice(0, 12),
     };
   } catch (err) {
     console.error("[skill-learner] Failed to parse session JSONL:", err.message);

@@ -472,7 +472,50 @@ def detect_signals(calendar, health, memory, tools, skills):
             "message": "本周记忆写入偏少，Jarvis 交互可能减少",
             "data": {"total_lines": memory["total_lines"]},
         })
-    
+
+    # Tool usage signals
+    if tools and tools.get("total_calls", 0) > 0:
+        total_calls = tools["total_calls"]
+        total_errors = tools["total_errors"]
+        overall_error_rate = total_errors / total_calls if total_calls else 0
+
+        if overall_error_rate > 0.1:
+            signals.append({
+                "category": "tool_quality",
+                "level": "warning",
+                "message": f"工具整体错误率 {overall_error_rate*100:.1f}%（{total_errors}/{total_calls}），建议排查",
+                "data": {"error_rate": round(overall_error_rate, 3), "total_errors": total_errors},
+            })
+
+        # Flag individual high-error-rate tools
+        for tool_info in tools.get("top_tools", []):
+            t_calls = tool_info["calls"]
+            t_errors = tool_info["errors"]
+            if t_calls >= 5 and t_errors / t_calls > 0.15:
+                signals.append({
+                    "category": "tool_quality",
+                    "level": "info",
+                    "message": f"工具 {tool_info['name']} 错误率 {t_errors/t_calls*100:.0f}%（{t_errors}/{t_calls}）",
+                    "data": {"tool": tool_info["name"], "error_rate": round(t_errors / t_calls, 3)},
+                })
+
+    # Skill learning rate signals
+    if skills:
+        if skills.get("evaluations", 0) > 0 and skills.get("new_skills", 0) == 0 and skills.get("updates", 0) == 0:
+            signals.append({
+                "category": "skill_learning",
+                "level": "info",
+                "message": f"本周 {skills['evaluations']} 次评估但无新技能产出，提示词可能偏严或会话复杂度不够",
+                "data": skills,
+            })
+        if skills.get("new_skills", 0) >= 3:
+            signals.append({
+                "category": "skill_learning",
+                "level": "info",
+                "message": f"本周新增 {skills['new_skills']} 个技能草稿，学习效率良好",
+                "data": skills,
+            })
+
     # Overall level
     levels = [s["level"] for s in signals]
     if "alert" in levels:

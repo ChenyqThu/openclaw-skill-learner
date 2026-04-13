@@ -124,10 +124,6 @@ def find_related_skill(request: dict, existing_skills: dict) -> tuple:
     user_text = " ".join(request.get("userMessages", [])).lower()
 
     for name, info in existing_skills.items():
-        # Skip auto-learned skills (those go into new creation)
-        if "/auto-learned/" in info["path"]:
-            continue
-
         desc = info["description"].lower()
         tags = [t.lower() for t in info["tags"]]
 
@@ -135,7 +131,7 @@ def find_related_skill(request: dict, existing_skills: dict) -> tuple:
         name_words = set(name.replace("-", " ").split())
         overlap_score = 0
         for word in name_words:
-            if word in user_text:
+            if len(word) >= 3 and word in user_text:  # skip short words like "a", "to"
                 overlap_score += 2
         for tag in tags:
             if tag in user_text or tag in tool_names:
@@ -144,7 +140,7 @@ def find_related_skill(request: dict, existing_skills: dict) -> tuple:
             if tool in desc or tool in name:
                 overlap_score += 1
 
-        if overlap_score >= 3:
+        if overlap_score >= 5:
             return name, info
 
     return None, None
@@ -159,36 +155,44 @@ def get_existing_skills_summary() -> str:
         if "/auto-learned/" in str(skill_md):
             continue
         try:
-            text = skill_md.read_text()[:1000]
+            text = skill_md.read_text()[:1500]
             name = skill_md.parent.name
             desc = ""
             fm = re.search(r"^---\s*\n(.*?)\n---", text, re.DOTALL | re.MULTILINE)
             if fm:
                 dm = re.search(r"description:\s*(.+)", fm.group(1))
                 if dm:
-                    desc = dm.group(1).strip().strip("\"'")[:100]
+                    desc = dm.group(1).strip().strip("\"'")[:200]
             if desc:
                 summary_lines.append(f"- {name}: {desc}")
         except Exception:
             continue
-    return "\n".join(summary_lines[:40]) if summary_lines else "(none)"
+    return "\n".join(summary_lines[:60]) if summary_lines else "(none)"
+
+
+def _format_messages(request: dict) -> tuple[str, str]:
+    """Format user and assistant messages with role + turn markers."""
+    user_msgs = request.get("userMessages", [])
+    asst_msgs = request.get("assistantTexts", [])
+    formatted_user = "\n".join(f"User [turn {i+1}]: {m}" for i, m in enumerate(user_msgs))
+    formatted_asst = "\n".join(f"Agent [turn {i+1}]: {t}" for i, t in enumerate(asst_msgs))
+    return formatted_user, formatted_asst
 
 
 def build_new_skill_prompt(request: dict) -> str:
     tool_info = f"{request['toolCount']} calls ({', '.join(request.get('toolNames', [])[:10])})"
-    user_msgs = "\n".join(f"{i+1}. {m}" for i, m in enumerate(request.get("userMessages", [])))
-    asst_msgs = "\n".join(f"{i+1}. {t}" for i, t in enumerate(request.get("assistantTexts", [])))
+    formatted_user, formatted_asst = _format_messages(request)
     existing = get_existing_skills_summary()
 
     return f"""You are evaluating an AI agent session to decide if a reusable Skill should be created.
 
 SESSION: {tool_info}
 
-USER REQUESTS:
-{user_msgs}
+CONVERSATION:
+{formatted_user}
 
 AGENT RESPONSES:
-{asst_msgs}
+{formatted_asst}
 
 EXISTING SKILLS (do NOT create a skill that duplicates these):
 {existing}
@@ -201,10 +205,16 @@ optimization, or general programming advice.
 Core test (from Hermes): "Did this session require trial and error, changing course due to
 experiential findings, or did the user correct the agent's approach?" If yes → strong Skill candidate.
 
+Trial-and-error signals to look for:
+- "didn't work", "tried", "instead", "realized", "turns out", "actually"
+- Agent changed approach mid-session after a failure
+- User corrected the agent: "不对", "不是", "应该", "错了", "no,", "wrong"
+
 ━━━ QUALIFICATION CRITERIA ━━━
 Need ALL of (A) + (B), plus at least one of (C)–(E):
 
-A. The pattern is reusable across ≥2 DIFFERENT future contexts (not just this one script/file)
+A. The pattern is reusable across ≥2 DIFFERENT future contexts
+   ("different" = different problem domain, different file type, or different tool chain)
 B. It's about Jarvis's tool usage or workflow orchestration — not "fix script X"
 C. Required non-obvious trial and error or course correction to discover
 D. Contains specific tool combos, parameters, or pitfalls worth documenting
@@ -214,11 +224,33 @@ E. The user corrected the agent's method — Jarvis would repeat the mistake wit
 • Improvement is "add error handling/retry to script X" → fix the script directly
 • Pattern only applies to one specific file/cron/config
 • The approach is obvious or already covered by an existing skill above
-• toolCount < 8 and no user correction
 
-If NOT qualified: output exactly: NO_SKILL
+━━━ EXAMPLES ━━━
 
-If qualified: output BOTH blocks below, in order:
+Example 1 — QUALIFIES (new skill):
+Session: Agent tried 3 approaches to parse a complex PDF, first with plain text extraction (failed),
+then with page-by-page OCR (too slow), finally discovered combining PyMuPDF structured extraction
+with fallback OCR only for scanned pages. User said "that's much better, remember this approach."
+→ This qualifies: trial-and-error (C), specific tool combo (D), reusable across PDF tasks (A).
+
+Example 2 — NO_SKILL:
+Session: Agent fixed a typo in config.yaml and restarted the service.
+→ NO_SKILL: one-off fix, not a behavioral pattern, not reusable.
+
+Example 3 — NO_SKILL:
+Session: Agent added logging to a Python script to debug an error, found the bug, removed the logging.
+→ NO_SKILL: standard debugging workflow, obvious approach, not worth documenting as a skill.
+
+━━━ INSTRUCTIONS ━━━
+
+Step 1 — REASONING (mandatory): Before deciding, analyze the session by answering:
+  (1) Is the pattern reusable across ≥2 different contexts? Why or why not?
+  (2) Is it about agent behavior/workflow, or just a code fix?
+  (3) Which of criteria C, D, E apply? Cite specific evidence from the conversation.
+
+Step 2 — DECISION:
+  If NOT qualified: output your reasoning, then on a new line: NO_SKILL
+  If qualified: output your reasoning, then BOTH blocks below in order:
 
 ```eval_json
 {{
@@ -242,23 +274,39 @@ tags: [<tag1>, <tag2>]
 # <name>
 
 ## When to Use
-<bullet list of scenarios>
+- Scenario 1
+- Scenario 2
+- Scenario 3
+
+## When NOT to Use
+- Anti-pattern 1 (when this skill does not apply)
+- Anti-pattern 2
 
 ## Procedure
-<numbered steps>
+1. Step 1: what to do and why
+2. Step 2: ...
+3. Step 3: ...
+
+## Example
+**Situation**: Brief description of a concrete scenario
+**Approach**: What Jarvis should do step-by-step
+**Result**: Expected outcome
 
 ## Pitfalls
-<bullet list>
+- Pitfall 1: what goes wrong if you miss this
+- Pitfall 2: ...
 
 ## Verification
-<how to confirm it worked>
+- How to confirm the approach worked (specific checks or success criteria)
+
+## Related Skills
+- List any related existing skills (or "None" if standalone)
 ```"""
 
 
 def build_update_skill_prompt(request: dict, skill_name: str, skill_content: str) -> str:
     tool_info = f"{request['toolCount']} calls ({', '.join(request.get('toolNames', [])[:10])})"
-    user_msgs = "\n".join(f"{i+1}. {m}" for i, m in enumerate(request.get("userMessages", [])))
-    asst_msgs = "\n".join(f"{i+1}. {t}" for i, t in enumerate(request.get("assistantTexts", [])))
+    formatted_user, formatted_asst = _format_messages(request)
     truncated_skill = skill_content[:3000]
 
     return f"""You are evaluating whether a session revealed new information to UPDATE an existing Skill.
@@ -268,21 +316,43 @@ EXISTING SKILL "{skill_name}" (truncated):
 
 SESSION: {tool_info}
 
-USER REQUESTS:
-{user_msgs}
+CONVERSATION:
+{formatted_user}
 
 AGENT RESPONSES:
-{asst_msgs}
+{formatted_asst}
 
 ━━━ EVALUATION CRITERIA (Hermes-inspired) ━━━
 Did this session reveal something NOT covered by the existing skill? Look for:
 1. A pitfall or error the agent hit that the skill didn't warn about
 2. A better/faster approach than what the skill describes (discovered via trial and error)
 3. The user corrected the agent's method — indicating a gap in the skill's guidance
+4. A new scenario where the skill applies but wasn't documented in "When to Use"
 
-If NONE of these apply: output exactly: NO_UPDATE
+━━━ EXAMPLE ━━━
 
-If update is warranted: output BOTH blocks below:
+Example — QUALIFIES for update:
+Existing skill: "Multi-Source Data Aggregation" describes using parallel API calls.
+Session: Agent hit a rate limit on source B, had to add exponential backoff + circuit breaker.
+User said "记住这个坑". The skill's Pitfalls section didn't mention rate limiting.
+→ UPDATE: add rate limiting pitfall + backoff procedure step.
+
+Example — NO_UPDATE:
+Existing skill: "Git Branch Cleanup" describes pruning merged branches.
+Session: Agent used the same procedure successfully on a different repo.
+→ NO_UPDATE: skill worked as documented, no new information.
+
+━━━ INSTRUCTIONS ━━━
+
+Step 1 — REASONING (mandatory): Analyze the session and explain:
+  (1) Did the agent encounter something the skill didn't cover?
+  (2) What specific gap was revealed? Cite evidence from the conversation.
+  (3) Is this gap generalizable (will other sessions hit it too)?
+
+Step 2 — DECISION:
+  If NONE of the criteria apply: output your reasoning, then: NO_UPDATE
+
+  If update is warranted: output your reasoning, then BOTH blocks below:
 
 ```eval_json
 {{
@@ -295,16 +365,20 @@ If update is warranted: output BOTH blocks below:
 }}
 ```
 
-```patch_yaml
-action: update
-skill: {skill_name}
-sections_to_add:
-  pitfalls:
-    - "New pitfall: ..."
-  procedure:
-    - "Additional step: ..."
-  notes:
-    - "New finding: ..."
+```skill_update
+## Sections to Add/Modify
+
+### Pitfalls (append)
+- New pitfall: ...
+
+### Procedure (append or modify)
+- Additional step: ...
+
+### When to Use (append if new scenario)
+- New scenario: ...
+
+### When NOT to Use (append if new boundary)
+- New anti-pattern: ...
 ```"""
 
 # ─── Processing ──────────────────────────────────────────────────────────────
