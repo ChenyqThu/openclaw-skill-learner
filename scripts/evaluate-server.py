@@ -35,6 +35,7 @@ from datetime import datetime
 DATA_DIR = Path.home() / ".openclaw/workspace/data/skill-learner"
 QUEUE_DIR = DATA_DIR / "analysis-queue"
 LOG_FILE = DATA_DIR / "server.log"
+SKIP_LIST_FILE = DATA_DIR / "skipped-skills.json"  # blacklist for skipped skill names
 EVALUATE_SCRIPT = Path(__file__).parent / "skill-learner-evaluate.py"
 
 # Add script dir to path so we can import skill-learner-evaluate and config
@@ -219,6 +220,10 @@ def send_feishu_notification(skill_name: str, action: str, tool_count: int,
             return "暂无"
         return "\n".join(f"- {i}" for i in items[:max_n])
 
+    # Quality score display
+    quality_data = ev.get("quality_score", {})
+    quality_total = quality_data.get("total", 0) if isinstance(quality_data, dict) else 0
+
     short_session = session_key.split(":")[-1][:40] if session_key else "unknown"
     tool_names_str = ", ".join(tool_names[:8]) if tool_names else "暂无"
 
@@ -236,7 +241,8 @@ def send_feishu_notification(skill_name: str, action: str, tool_count: int,
     if pitfalls:
         patterns_and_pitfalls += f"**已知雷区**\n{fmt_list(pitfalls, 4)}"
 
-    detail_content = f"**来源**：{agent_id}\n**Session**：`{short_session}`\n**工具涉及**：{tool_count} 次\n**工具列表**：{tool_names_str}"
+    quality_line = f"\n**质量评分**：{quality_total}/100" if quality_total > 0 else ""
+    detail_content = f"**来源**：{agent_id}\n**Session**：`{short_session}`\n**工具涉及**：{tool_count} 次\n**工具列表**：{tool_names_str}{quality_line}"
 
     # ── Build Card JSON (2.0) ───────────────────────────────────────────────────
     body_elements = [
@@ -311,7 +317,7 @@ def send_feishu_notification(skill_name: str, action: str, tool_count: int,
         "schema": "2.0",
         "config": {"width_mode": "fill"},
         "header": {
-            "title": {"content": f"🧠 Skill 候选 · {action_label} · {skill_name}", "tag": "plain_text"},
+            "title": {"content": f"🧠 Skill 候选 · {action_label} · {skill_name}" + (f" · {quality_total}分" if quality_total > 0 else ""), "tag": "plain_text"},
             "template": header_color,
         },
         "body": {
@@ -320,41 +326,25 @@ def send_feishu_notification(skill_name: str, action: str, tool_count: int,
             "elements": body_elements,
         },
     }
-    # ── Send via Feishu API ─────────────────────────────────────────────────────
-    token = _get_feishu_token()
-    if not token:
-        log.warning("No Feishu token, falling back to plain text notification")
-        _send_feishu_plain_fallback(skill_name, action_label, tool_count, agent_id, session_key)
-        return
-
-    msg_body: dict = {
-        "msg_type": "interactive",
-        "content": json.dumps(card),
-    }
-    if last_inbound_message_id:
-        url = f"https://open.feishu.cn/open-apis/im/v1/messages/{last_inbound_message_id}/reply"
-        msg_body["reply_in_thread"] = False
-        log.info(f"Replying to message {last_inbound_message_id}")
-    else:
-        url = "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=open_id"
-        msg_body["receive_id"] = FEISHU_TARGET_OPEN_ID
-        log.info("Sending as new DM (no inbound message id available)")
-
-    payload = json.dumps(msg_body).encode()
-    req = ureq.Request(
-        url, data=payload,
-        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-    )
+    # ── Send via openclaw CLI (avoids token management in launchd env) ──────────
+    card_json = json.dumps(card)
+    cmd = [
+        "openclaw", "message", "send",
+        "--channel", "feishu",
+        "--target", f"user:{FEISHU_TARGET_OPEN_ID}",
+        "--card", card_json,
+    ]
     try:
-        with ureq.urlopen(req, timeout=15) as resp:
-            result = json.loads(resp.read())
-            if result.get("code") == 0:
-                log.info(f"Feishu card sent for skill: {skill_name} ({action_label})")
-            else:
-                log.warning(f"Feishu card send failed (code={result.get('code')}): {result.get('msg')}")
-                _send_feishu_plain_fallback(skill_name, action_label, tool_count, agent_id, session_key)
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=20
+        )
+        if result.returncode == 0:
+            log.info(f"Feishu card sent for skill: {skill_name} ({action_label})")
+        else:
+            log.warning(f"openclaw message send failed (rc={result.returncode}): {result.stderr.strip()}")
+            _send_feishu_plain_fallback(skill_name, action_label, tool_count, agent_id, session_key)
     except Exception as e:
-        log.warning(f"Feishu card send exception: {e}")
+        log.warning(f"Card send exception: {e}")
         _send_feishu_plain_fallback(skill_name, action_label, tool_count, agent_id, session_key)
 
 def _send_feishu_plain_fallback(skill_name: str, action_label: str, tool_count: int,
@@ -428,9 +418,26 @@ def handle_evaluate(body: dict) -> dict:
             if _pending_review_path and _pending_review_path.exists():
                 existing2 = json.loads(_pending_review_path.read_text())
                 new_items = [item for item in existing2 if item.get("skillName") not in pending_before]
+                # Load skip blacklist
+                skip_list = set()
+                try:
+                    if SKIP_LIST_FILE.exists():
+                        skip_list = set(json.loads(SKIP_LIST_FILE.read_text()))
+                except Exception:
+                    pass
+
                 for item in new_items:
                     skill_name = item.get("skillName", "unknown")
                     action = item.get("action", "create")
+                    # Skip if user previously rejected this skill name
+                    if skill_name in skip_list:
+                        log.info(f"Skipping notification for blacklisted skill: {skill_name}")
+                        continue
+                    # Quality-gate: only notify for quality >= 40 (low quality stored silently)
+                    quality_score = item.get("qualityScore", 0)
+                    if quality_score > 0 and quality_score < 40:
+                        log.info(f"Quality too low ({quality_score}/100), silent store: {skill_name}")
+                        continue
                     tool_count = item.get("toolCount", body.get("toolCount", 0))
                     agent_id = body.get("agentId", "jarvis")
                     session_key = body.get("sessionKey", "")

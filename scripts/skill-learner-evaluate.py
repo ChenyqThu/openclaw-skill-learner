@@ -11,6 +11,7 @@ Usage:
 """
 
 import fcntl
+import importlib.util
 import json
 import os
 import re
@@ -25,6 +26,56 @@ PENDING_REVIEW = SKILLS_DIR / ".pending-review.json"
 GEMINI_MODEL = "gemini-3-flash-preview"  # upgraded from 3.1-flash-lite for better judgment accuracy
 
 DRY_RUN = "--dry-run" in sys.argv
+
+# ─── Pluggable Prompt Loading ───────────────────────────────────────────────
+# Set PROMPT_VERSION env var to use an optimized prompt (e.g., "v2_r1")
+# Defaults to built-in prompts if not set or module not found.
+
+_prompt_module = None
+
+def _load_prompt_module():
+    global _prompt_module
+    version = os.environ.get("PROMPT_VERSION")
+    if not version:
+        return None
+    prompt_file = Path(__file__).parent / "prompts" / f"{version}.py"
+    if not prompt_file.exists():
+        return None
+    try:
+        spec = importlib.util.spec_from_file_location(f"prompts.{version}", str(prompt_file))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _prompt_module = mod
+        print(f"Loaded prompt version: {version}")
+        return mod
+    except Exception as e:
+        print(f"WARN: Failed to load prompt {version}: {e}, using built-in")
+        return None
+
+_load_prompt_module()
+
+
+# ─── Pre-filter (data-driven) ───────────────────────────────────────────────
+
+def should_skip_session(request: dict) -> str | None:
+    """
+    Data-driven pre-filter. Returns skip reason string, or None to proceed.
+    Designed for <5% false negative rate on labeled test data.
+    """
+    asst_texts = request.get("assistantTexts", [])
+    total_asst_chars = sum(len(t) for t in asst_texts)
+
+    # Signal 1: Very short assistant output — not enough substance for a skill
+    if total_asst_chars < 100:
+        return f"asst_chars={total_asst_chars} < 100"
+
+    # Signal 2: Single tool type + no user messages = simple subagent execution
+    tool_types = set(request.get("toolNames", []))
+    user_msgs = request.get("userMessages", [])
+    if len(tool_types) <= 1 and len(user_msgs) == 0 and request.get("toolCount", 0) < 10:
+        return f"single_tool_no_user (types={tool_types})"
+
+    return None
 
 
 # ─── Result Parsers ──────────────────────────────────────────────────────────
@@ -186,6 +237,20 @@ def build_new_skill_prompt(request: dict) -> str:
 
     return f"""You are evaluating an AI agent session to decide if a reusable Skill should be created.
 
+━━━ SYSTEM CONTEXT ━━━
+OpenClaw is an AI agent orchestration platform. "Jarvis" is the primary agent instance,
+accessible via Feishu (Chinese workplace platform, similar to Slack). Jarvis handles:
+- Direct user conversations (Feishu DMs) — interactive problem-solving
+- Cron/scheduled tasks — daily journal, intel gathering, morning reports, memory sync
+- Subagent spawning — parallel task decomposition via sessions_spawn tool
+
+Jarvis's tool set includes: exec (shell commands), read/write/edit (files), process (background jobs),
+sessions_spawn/sessions_history (agent orchestration), web_fetch/browser (web), feishu_* (docs/messages),
+and domain-specific tools (nano-banana-image, notebooklm, etc.).
+
+Skills are stored as SKILL.md files in ~/.openclaw/workspace/skills/ and loaded by Jarvis at runtime
+to guide behavioral patterns for recurring task types.
+
 SESSION: {tool_info}
 
 CONVERSATION:
@@ -209,21 +274,46 @@ Trial-and-error signals to look for:
 - "didn't work", "tried", "instead", "realized", "turns out", "actually"
 - Agent changed approach mid-session after a failure
 - User corrected the agent: "不对", "不是", "应该", "错了", "no,", "wrong"
+- Agent self-corrected: "操", "赶紧恢复", "我想简单了", "想错了"
+
+IMPORTANT — Focus on the PATTERN, not the surface context:
+Even if a session is about a specific system (e.g., fixing evaluate-server.py), the
+underlying pattern may be highly reusable. Ask: "Would this approach help Jarvis in a
+DIFFERENT system with a similar class of problem?" For example:
+- Debugging a launchd service → pattern: "diagnosing background service env issues"
+- Fixing notification delivery → pattern: "tracing multi-hop notification pipelines"
+- Data pipeline with error recovery → pattern: "resilient multi-source data collection"
 
 ━━━ QUALIFICATION CRITERIA ━━━
 Need ALL of (A) + (B), plus at least one of (C)–(E):
 
-A. The pattern is reusable across ≥2 DIFFERENT future contexts
+A. The PATTERN (not the specific fix) is reusable across ≥2 DIFFERENT future contexts
    ("different" = different problem domain, different file type, or different tool chain)
 B. It's about Jarvis's tool usage or workflow orchestration — not "fix script X"
+   NOTE: Even sessions that FIX something can reveal reusable orchestration patterns.
+   The question is whether the APPROACH (not the fix itself) transfers to other scenarios.
 C. Required non-obvious trial and error or course correction to discover
-D. Contains specific tool combos, parameters, or pitfalls worth documenting
+D. Contains specific tool combos, parameters, sequencing, or pitfalls worth documenting
 E. The user corrected the agent's method — Jarvis would repeat the mistake without this
 
+━━━ DEVIATION TEST (mandatory) ━━━
+Before qualifying a skill, you MUST identify a specific DEVIATION — a moment where the
+agent's path diverged from what would be expected. Examples of deviations:
+- Agent tried approach A, it failed, switched to approach B
+- Agent discovered an unexpected pitfall mid-execution
+- User corrected the agent's direction
+- Agent combined tools in a non-obvious sequence
+If you cannot point to a specific deviation moment, output NO_SKILL.
+
 ━━━ RED FLAGS → output NO_SKILL ━━━
-• Improvement is "add error handling/retry to script X" → fix the script directly
-• Pattern only applies to one specific file/cron/config
-• The approach is obvious or already covered by an existing skill above
+• Pattern only applies to one specific file/config AND the approach is trivial
+• The session merely follows a pre-written script without any deviation or discovery
+• The approach is obvious (standard debugging, simple file edit, routine API call)
+• An existing skill above already covers this exact pattern
+• Cron/scheduled task that completed successfully by following its instructions step-by-step
+  (even if it uses many tools — using many tools is NOT the same as discovering a pattern)
+• Session describes a standard data read → format → output pipeline with no surprises
+• Agent merely synced data between two systems without encountering obstacles
 
 ━━━ EXAMPLES ━━━
 
@@ -233,74 +323,94 @@ then with page-by-page OCR (too slow), finally discovered combining PyMuPDF stru
 with fallback OCR only for scanned pages. User said "that's much better, remember this approach."
 → This qualifies: trial-and-error (C), specific tool combo (D), reusable across PDF tasks (A).
 
-Example 2 — NO_SKILL:
-Session: Agent fixed a typo in config.yaml and restarted the service.
-→ NO_SKILL: one-off fix, not a behavioral pattern, not reusable.
+Example 2 — QUALIFIES (pattern from debugging session):
+Session: Agent was debugging why Feishu card notifications failed. Traced the issue through:
+plugin → HTTP POST → evaluate-server → Feishu API → discovered launchd env var missing.
+→ This qualifies: the PATTERN "tracing notification delivery through multi-hop pipeline"
+  is reusable for any notification/webhook debugging (A), required trial-and-error (C),
+  specific diagnostic sequence (D).
 
 Example 3 — NO_SKILL:
-Session: Agent added logging to a Python script to debug an error, found the bug, removed the logging.
-→ NO_SKILL: standard debugging workflow, obvious approach, not worth documenting as a skill.
+Session: Agent fixed a typo in config.yaml and restarted the service.
+→ NO_SKILL: one-off fix, trivial approach, not a behavioral pattern.
+
+Example 4 — NO_SKILL:
+Session: Daily journal cron — agent reads session logs, writes diary entry, updates index.
+No errors, no course corrections, followed the script exactly.
+→ NO_SKILL: routine execution without any novel discovery or approach change.
 
 ━━━ INSTRUCTIONS ━━━
 
 Step 1 — REASONING (mandatory): Before deciding, analyze the session by answering:
-  (1) Is the pattern reusable across ≥2 different contexts? Why or why not?
-  (2) Is it about agent behavior/workflow, or just a code fix?
-  (3) Which of criteria C, D, E apply? Cite specific evidence from the conversation.
+  (1) What is the underlying PATTERN? (abstract away from the specific system)
+  (2) DEVIATION TEST: Point to the specific moment the agent deviated from the expected
+      path. Quote the relevant text. If no deviation exists, this is NOT a skill.
+  (3) Is this pattern reusable across ≥2 different contexts? Why or why not?
+  (4) Which of criteria C, D, E apply? Cite specific evidence from the conversation.
 
 Step 2 — DECISION:
   If NOT qualified: output your reasoning, then on a new line: NO_SKILL
-  If qualified: output your reasoning, then BOTH blocks below in order:
+  If qualified: output your reasoning, then BOTH blocks below in order.
+
+⚠️ LANGUAGE REQUIREMENT: ALL text fields MUST be written in Simplified Chinese (简体中文). skill_name may use Chinese or a short English identifier. Do NOT write English prose in any field.
 
 ```eval_json
 {{
-  "skill_name": "<concise Title Case name>",
-  "problem_context": "<1-2 sentences: what recurring challenge this solves, why non-obvious>",
-  "recommended_approach": "<2-4 sentences: the key insight, what makes it work, when to apply it>",
-  "when_to_use": ["<scenario 1>", "<scenario 2>", "<scenario 3>"],
-  "key_patterns": ["<specific tool combo or param 1>", "<pattern 2>"],
-  "pitfalls": ["<pitfall 1>", "<pitfall 2>"]
+  "skill_name": "<简洁名称，中文或短英文>",
+  "problem_context": "<1-2句：这个模式解决什么反复出现的挑战，为什么不显而易见>",
+  "recommended_approach": "<2-4句：核心洞察、为什么有效、何时应用>",
+  "when_to_use": ["<场景1>", "<场景2>", "<场景3>"],
+  "key_patterns": ["<具体工具组合或参数1>", "<模式2>"],
+  "pitfalls": ["<雷区1>", "<雷区2>"],
+  "quality_score": {{
+    "reusability": <1-10, 能跨多少不同场景使用>,
+    "insight_depth": <1-10, 多大程度超越显而易见的做法>,
+    "specificity": <1-10, 步骤是否足够具体可执行>,
+    "pitfall_coverage": <1-10, 雷区和边界情况覆盖>,
+    "completeness": <1-10, SKILL.md 各节是否完整>,
+    "total": <0-100, 五项加权总分: reusability×25 + insight_depth×25 + specificity×20 + pitfall_coverage×15 + completeness×15>
+  }}
 }}
 ```
 
 ```skill_md
 ---
 name: <name>
-description: <one-line description>
+description: <一句话描述（中文）>
 version: 1.0.0
 tags: [<tag1>, <tag2>]
 ---
 
 # <name>
 
-## When to Use
-- Scenario 1
-- Scenario 2
-- Scenario 3
+## 适用场景
+- 场景1
+- 场景2
+- 场景3
 
-## When NOT to Use
-- Anti-pattern 1 (when this skill does not apply)
-- Anti-pattern 2
+## 不适用场景
+- 反模式1
+- 反模式2
 
-## Procedure
-1. Step 1: what to do and why
-2. Step 2: ...
-3. Step 3: ...
+## 操作步骤
+1. 第一步：做什么及原因
+2. 第二步：...
+3. 第三步：...
 
-## Example
-**Situation**: Brief description of a concrete scenario
-**Approach**: What Jarvis should do step-by-step
-**Result**: Expected outcome
+## 示例
+**场景**：具体场景简述
+**做法**：逐步操作
+**结果**：预期产出
 
-## Pitfalls
-- Pitfall 1: what goes wrong if you miss this
-- Pitfall 2: ...
+## 已知雷区
+- 雷区1：错过会发生什么
+- 雷区2：...
 
-## Verification
-- How to confirm the approach worked (specific checks or success criteria)
+## 验证方式
+- 如何确认成功生效
 
-## Related Skills
-- List any related existing skills (or "None" if standalone)
+## 相关 Skill
+- 列出相关已有 Skill，或写「无」
 ```"""
 
 
@@ -310,6 +420,11 @@ def build_update_skill_prompt(request: dict, skill_name: str, skill_content: str
     truncated_skill = skill_content[:3000]
 
     return f"""You are evaluating whether a session revealed new information to UPDATE an existing Skill.
+
+━━━ SYSTEM CONTEXT ━━━
+OpenClaw is an AI agent orchestration platform. "Jarvis" is the primary agent, accessible via
+Feishu (Chinese workplace platform). Sessions include: direct conversations, cron tasks (daily
+journal, intel gathering, morning reports), and subagent spawning for parallel work.
 
 EXISTING SKILL "{skill_name}" (truncated):
 {truncated_skill}
@@ -352,16 +467,26 @@ Step 1 — REASONING (mandatory): Analyze the session and explain:
 Step 2 — DECISION:
   If NONE of the criteria apply: output your reasoning, then: NO_UPDATE
 
-  If update is warranted: output your reasoning, then BOTH blocks below:
+  If update is warranted: output your reasoning, then BOTH blocks below.
+
+⚠️ LANGUAGE REQUIREMENT: ALL text fields MUST be written in Simplified Chinese (简体中文). Do NOT write English prose in any field.
 
 ```eval_json
 {{
   "skill_name": "{skill_name}",
-  "problem_context": "<what new gap was discovered in this session>",
-  "recommended_approach": "<the better approach or fix, and why it's an improvement>",
-  "when_to_use": ["<updated scenario if any>"],
-  "new_pitfalls": ["<new pitfall 1>", "<new pitfall 2>"],
-  "key_changes": ["<what changes and why>"]
+  "problem_context": "<本次 session 发现了现有 Skill 中的什么空白>",
+  "recommended_approach": "<更好的做法或修正，为什么是改进>",
+  "when_to_use": ["<更新后的适用场景>"],
+  "new_pitfalls": ["<新雷区1>", "<新雷区2>"],
+  "key_changes": ["<修改什么及原因>"],
+  "quality_score": {{
+    "reusability": <1-10>,
+    "insight_depth": <1-10>,
+    "specificity": <1-10>,
+    "pitfall_coverage": <1-10>,
+    "completeness": <1-10>,
+    "total": <0-100, 五项加权总分: reusability×25 + insight_depth×25 + specificity×20 + pitfall_coverage×15 + completeness×15>
+  }}
 }}
 ```
 
@@ -421,8 +546,14 @@ def process_queue():
             print(f"─── {req_file.name} ───")
             print(f"  Tools: {request['toolCount']} ({', '.join(request.get('toolNames', [])[:6])})")
 
-            # Pre-filter removed: plugin threshold (8) is now the sole gatekeeper.
-            # Sessions reaching here have already passed the plugin's TOOL_CALL_THRESHOLD.
+            # Data-driven pre-filter (conservative: <5% false negative rate)
+            skip_reason = should_skip_session(request)
+            if skip_reason:
+                print(f"  ⏭️ Pre-filtered: {skip_reason}")
+                request["status"] = "pre_filtered"
+                request["skipReason"] = skip_reason
+                req_file.write_text(json.dumps(request, indent=2))
+                continue
 
             # Check if session actually USED an existing skill (precise signal from hook)
             # Fall back to topic-overlap heuristic if no hook data
@@ -449,7 +580,10 @@ def process_queue():
                     continue
 
                 skill_content = Path(related_info["path"]).read_text()
-                prompt = build_update_skill_prompt(request, related_name, skill_content)
+                if _prompt_module:
+                    prompt = _prompt_module.build_update_skill_prompt(request, related_name, skill_content)
+                else:
+                    prompt = build_update_skill_prompt(request, related_name, skill_content)
                 result = call_gemini(prompt)
 
                 if not result:
@@ -508,7 +642,11 @@ def process_queue():
                     req_file.write_text(json.dumps(request, indent=2))
                     continue
 
-                prompt = build_new_skill_prompt(request)
+                if _prompt_module:
+                    existing = get_existing_skills_summary()
+                    prompt = _prompt_module.build_new_skill_prompt(request, existing)
+                else:
+                    prompt = build_new_skill_prompt(request)
                 result = call_gemini(prompt)
 
                 if not result:
@@ -542,6 +680,10 @@ def process_queue():
                     "toolNames": request.get("toolNames", []),
                     "status": "pending_review",
                 }, indent=2))
+                # Extract quality_score if present
+                quality = eval_data.get("quality_score", {})
+                quality_total = quality.get("total", 0) if isinstance(quality, dict) else 0
+
                 # Write .eval.json for richer notification card
                 (skill_dir / ".eval.json").write_text(json.dumps({
                     "action": "create",
@@ -553,13 +695,24 @@ def process_queue():
                     **eval_data,
                 }, indent=2, ensure_ascii=False))
 
-                print(f"  \u2705 New skill draft: {skill_name}")
+                # Quality-gate: low-score skills stored silently
+                if quality_total > 0 and quality_total < 40:
+                    print(f"  ⚠️ Low quality ({quality_total}/100), stored silently: {skill_name}")
+                    request["status"] = "low_quality"
+                    request["skillName"] = skill_name
+                    request["qualityScore"] = quality_total
+                    req_file.write_text(json.dumps(request, indent=2))
+                    continue
+
+                quality_label = f" (quality: {quality_total}/100)" if quality_total > 0 else ""
+                print(f"  \u2705 New skill draft: {skill_name}{quality_label}")
                 skills_created.append({
                     "skillName": skill_name,
                     "toolCount": request["toolCount"],
                     "toolNames": request.get("toolNames", [])[:10],
                     "createdAt": datetime.now().isoformat(),
                     "action": "create",
+                    "qualityScore": quality_total,
                     "lastInboundMessageId": request.get("lastInboundMessageId"),
                 })
 
