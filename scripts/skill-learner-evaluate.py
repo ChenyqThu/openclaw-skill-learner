@@ -20,7 +20,7 @@ QUEUE_DIR = Path.home() / ".openclaw/workspace/data/skill-learner/analysis-queue
 SKILLS_DIR = Path.home() / ".openclaw/workspace/skills/auto-learned"
 ALL_SKILLS_DIR = Path.home() / ".openclaw/workspace/skills"
 PENDING_REVIEW = SKILLS_DIR / ".pending-review.json"
-GEMINI_MODEL = "gemini-2.5-flash-preview-04-17"  # upgraded from flash-lite for better judgment
+GEMINI_MODEL = "gemini-3-flash-preview"  # upgraded from 3.1-flash-lite for better judgment accuracy
 
 DRY_RUN = "--dry-run" in sys.argv
 
