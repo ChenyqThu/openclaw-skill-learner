@@ -58,7 +58,7 @@ This separation is required by OpenClaw's security scanner, which blocks network
 │    YES → build_update_skill_prompt()                 │
 │    NO  → build_new_skill_prompt()                    │
 │                                                      │
-│  Call Gemini 2.5 Flash                               │
+│  Call Gemini 3 Flash                                 │
 │    → parse eval_json block (problem/approach/etc.)   │
 │    → parse skill_md block                            │
 │    → write SKILL.md + .meta.json + .eval.json        │

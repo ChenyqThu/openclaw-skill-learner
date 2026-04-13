@@ -28,6 +28,13 @@ import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+# Add script dir to path for config import
+sys.path.insert(0, str(Path(__file__).parent))
+from config import (
+    NOTION_CALENDAR_DB, HEALTH_GITHUB_REPO,
+    WORKSPACE, DATA_DIR, QUEUE_DIR, MEMORY_MD,
+)
+
 # ─── Configuration ────────────────────────────────────────────────────────────
 DAYS = 7
 for i, arg in enumerate(sys.argv):
@@ -37,19 +44,11 @@ for i, arg in enumerate(sys.argv):
 JSON_ONLY = "--json" in sys.argv
 DRY_RUN = "--dry-run" in sys.argv
 
-WORKSPACE = Path.home() / ".openclaw/workspace"
 MEMORY_DIR = WORKSPACE / "memory"
-MEMORY_MD = WORKSPACE / "MEMORY.md"
-SKILL_LEARNER_DIR = WORKSPACE / "data/skill-learner"
+SKILL_LEARNER_DIR = DATA_DIR
 TOOL_STATS_FILE = SKILL_LEARNER_DIR / "tool-usage-stats.json"
-ANALYSIS_QUEUE_DIR = SKILL_LEARNER_DIR / "analysis-queue"
+ANALYSIS_QUEUE_DIR = QUEUE_DIR
 MEMORY_HEALTH_FILE = SKILL_LEARNER_DIR / "memory-health.json"
-
-# Notion Calendar DB
-NOTION_CALENDAR_DB = "2f015375830d80b7b057cfe94de8a40c"
-
-# Health data
-HEALTH_GITHUB_REPO = "ChenyqThu/health-data"
 
 # Timezone
 TZ_PT = timezone(timedelta(hours=-7))  # PDT

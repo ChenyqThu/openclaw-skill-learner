@@ -19,7 +19,7 @@ import os from "node:os";
 import http from "node:http";
 
 // ─── Configuration ───────────────────────────────────────────────────────────
-const TOOL_CALL_THRESHOLD = 5;
+const TOOL_CALL_THRESHOLD = 8;
 const DATA_DIR = path.join(os.homedir(), ".openclaw/workspace/data/skill-learner");
 const MEMORY_MD_PATH = path.join(os.homedir(), ".openclaw/workspace/MEMORY.md");
 const EVALUATE_SERVER_URL = "http://127.0.0.1:8300/evaluate";
@@ -218,6 +218,22 @@ async function writeQueueFile(payload) {
 }
 
 // ─── HTTP Fire-and-Forget to evaluate-server ─────────────────────────────────
+
+function buildFallbackPayload(body, fallbackSessionFile) {
+  return {
+    sessionFile: fallbackSessionFile || null,
+    createdAt: body.timestamp || new Date().toISOString(),
+    toolCount: body.toolCount,
+    toolNames: body.toolNames,
+    userMessages: body.userMessages,
+    assistantTexts: body.assistantTexts,
+    skillsUsed: body.skillsUsed,
+    runId: body.runId,
+    agentId: body.agentId,
+    sessionKey: body.sessionKey,
+  };
+}
+
 /**
  * POST JSON body to localhost:8300/evaluate.
  * Non-blocking: we do not await a response.
@@ -244,38 +260,13 @@ function fireEvaluate(body, fallbackSessionFile) {
 
   req.on("error", (err) => {
     console.warn(`[skill-learner] ⚠️ evaluate-server unreachable (${err.message}), writing queue fallback`);
-    // Fallback: write queue file for 3:30 AM cron
-    const fallbackPayload = {
-      sessionFile: fallbackSessionFile || null,
-      createdAt: body.timestamp || new Date().toISOString(),
-      toolCount: body.toolCount,
-      toolNames: body.toolNames,
-      userMessages: body.userMessages,
-      assistantTexts: body.assistantTexts,
-      skillsUsed: body.skillsUsed,
-      runId: body.runId,
-      agentId: body.agentId,
-      sessionKey: body.sessionKey,
-    };
-    writeQueueFile(fallbackPayload).catch(() => {});
+    writeQueueFile(buildFallbackPayload(body, fallbackSessionFile)).catch(() => {});
   });
 
   req.setTimeout(5000, () => {
     req.destroy();
     console.warn("[skill-learner] ⚠️ evaluate-server timeout, writing queue fallback");
-    const fallbackPayload = {
-      sessionFile: fallbackSessionFile || null,
-      createdAt: body.timestamp || new Date().toISOString(),
-      toolCount: body.toolCount,
-      toolNames: body.toolNames,
-      userMessages: body.userMessages,
-      assistantTexts: body.assistantTexts,
-      skillsUsed: body.skillsUsed,
-      runId: body.runId,
-      agentId: body.agentId,
-      sessionKey: body.sessionKey,
-    };
-    writeQueueFile(fallbackPayload).catch(() => {});
+    writeQueueFile(buildFallbackPayload(body, fallbackSessionFile)).catch(() => {});
   });
 
   req.write(data);
@@ -288,7 +279,8 @@ async function checkMemoryHealth() {
     const content = await fs.readFile(MEMORY_MD_PATH, "utf-8");
     const lines = content.split("\n").length;
     const chars = content.length;
-    const recentEntries = (content.match(/^### \[2026-/gm) || []).length;
+    const year = new Date().getFullYear();
+    const recentEntries = (content.match(new RegExp(`^### \\[${year}-`, "gm")) || []).length;
     const status = lines > MEMORY_LINE_DANGER ? "danger" : lines > MEMORY_LINE_WARN ? "warning" : "healthy";
     const health = {
       timestamp: new Date().toISOString(),
@@ -366,10 +358,14 @@ export default definePluginEntry({
 
       const count = run.toolCalls.length;
       if (count < TOOL_CALL_THRESHOLD) {
-        // Housekeeping
+        // Housekeeping: keep last 10 runs, clean all related maps/sets
         if (runStats.size > 20) {
           const keys = [...runStats.keys()];
-          for (const k of keys.slice(0, keys.length - 10)) runStats.delete(k);
+          for (const k of keys.slice(0, keys.length - 10)) {
+            runStats.delete(k);
+            runSkillsUsed.delete(k);
+            agentEndFiredHttp.delete(k);
+          }
         }
         return;
       }
@@ -412,10 +408,14 @@ export default definePluginEntry({
       // Fire-and-forget HTTP POST
       fireEvaluate(payload, null);
 
-      // Housekeeping: keep last 10 runs
+      // Housekeeping: keep last 10 runs, clean all related maps/sets
       if (runStats.size > 20) {
         const keys = [...runStats.keys()];
-        for (const k of keys.slice(0, keys.length - 10)) runStats.delete(k);
+        for (const k of keys.slice(0, keys.length - 10)) {
+          runStats.delete(k);
+          runSkillsUsed.delete(k);
+          agentEndFiredHttp.delete(k);
+        }
       }
     });
 

@@ -165,8 +165,8 @@ python3 scripts/skill-learner-evaluate.py --dry-run  # preview only
 
 | Constant | Default | Description |
 |----------|---------|-------------|
-| `GEMINI_MODEL` | `gemini-2.5-flash-preview-04-17` | Gemini model for evaluation |
-| `TOOL_CALL_THRESHOLD` | `8` (pre-filter) | Sessions below this + no correction are skipped |
+| `GEMINI_MODEL` | `gemini-3-flash-preview` | Gemini model for evaluation |
+| `TOOL_CALL_THRESHOLD` | `8` (plugin) | Minimum tool calls to trigger evaluation |
 
 ---
 

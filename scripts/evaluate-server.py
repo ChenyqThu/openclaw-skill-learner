@@ -24,6 +24,9 @@ import time
 import threading
 import subprocess
 import logging
+import random
+import string
+import signal
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from datetime import datetime
@@ -34,8 +37,9 @@ QUEUE_DIR = DATA_DIR / "analysis-queue"
 LOG_FILE = DATA_DIR / "server.log"
 EVALUATE_SCRIPT = Path(__file__).parent / "skill-learner-evaluate.py"
 
-# Add script dir to path so we can import skill-learner-evaluate
+# Add script dir to path so we can import skill-learner-evaluate and config
 sys.path.insert(0, str(Path(__file__).parent))
+from config import FEISHU_TARGET_OPEN_ID
 
 # ─── Logging Setup ────────────────────────────────────────────────────────────
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -50,6 +54,10 @@ logging.basicConfig(
 )
 log = logging.getLogger("evaluate-server")
 
+# ─── Constants ────────────────────────────────────────────────────────────────
+MAX_BODY_SIZE = 1 * 1024 * 1024  # 1 MB
+RATE_LIMIT_PER_MIN = 5
+
 # ─── State ────────────────────────────────────────────────────────────────────
 start_time = time.time()
 evaluated_count = 0
@@ -60,14 +68,18 @@ eval_lock = threading.Lock()
 # Rate limiting: max 5 Gemini calls per minute
 rate_lock = threading.Lock()
 gemini_call_times = []  # timestamps of recent Gemini calls
-RATE_LIMIT_PER_MIN = 5
+
+# Notification threads tracking (for graceful shutdown)
+_notification_threads = []
+_notification_lock = threading.Lock()
 
 # ─── Import evaluator ─────────────────────────────────────────────────────────
 _evaluator_imported = False
 _process_queue = None
+_pending_review_path = None
 
 def _import_evaluator():
-    global _evaluator_imported, _process_queue
+    global _evaluator_imported, _process_queue, _pending_review_path
     if _evaluator_imported:
         return True
     try:
@@ -76,6 +88,7 @@ def _import_evaluator():
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
         _process_queue = mod.process_queue
+        _pending_review_path = mod.PENDING_REVIEW
         _evaluator_imported = True
         log.info(f"Imported evaluator from {EVALUATE_SCRIPT}")
         return True
@@ -100,8 +113,6 @@ def check_rate_limit() -> bool:
 def write_queue_file(body: dict) -> str:
     """Write a queue-compatible JSON file and return its request ID."""
     QUEUE_DIR.mkdir(parents=True, exist_ok=True)
-    import random
-    import string
     random_suffix = ''.join(random.choices(string.ascii_lowercase + string.digits, k=6))
     request_id = f"{int(time.time() * 1000)}-{random_suffix}"
 
@@ -326,7 +337,7 @@ def send_feishu_notification(skill_name: str, action: str, tool_count: int,
         log.info(f"Replying to message {last_inbound_message_id}")
     else:
         url = "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=open_id"
-        msg_body["receive_id"] = "ou_8d1ce0fa1d435070ed695baeabe25adc"
+        msg_body["receive_id"] = FEISHU_TARGET_OPEN_ID
         log.info("Sending as new DM (no inbound message id available)")
 
     payload = json.dumps(msg_body).encode()
@@ -402,13 +413,8 @@ def handle_evaluate(body: dict) -> dict:
         # Snapshot pending review file before evaluation
         pending_before = set()
         try:
-            import importlib.util
-            spec = importlib.util.spec_from_file_location("skill_learner_evaluate", str(EVALUATE_SCRIPT))
-            mod = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(mod)
-            pending_review_path = mod.PENDING_REVIEW
-            if pending_review_path.exists():
-                existing = json.loads(pending_review_path.read_text())
+            if _pending_review_path and _pending_review_path.exists():
+                existing = json.loads(_pending_review_path.read_text())
                 pending_before = {item.get("skillName") for item in existing}
         except Exception:
             pending_before = set()
@@ -419,12 +425,8 @@ def handle_evaluate(body: dict) -> dict:
 
         # Check what new skills/updates were created
         try:
-            spec2 = importlib.util.spec_from_file_location("skill_learner_evaluate2", str(EVALUATE_SCRIPT))
-            mod2 = importlib.util.module_from_spec(spec2)
-            spec2.loader.exec_module(mod2)
-            pending_review_path2 = mod2.PENDING_REVIEW
-            if pending_review_path2.exists():
-                existing2 = json.loads(pending_review_path2.read_text())
+            if _pending_review_path and _pending_review_path.exists():
+                existing2 = json.loads(_pending_review_path.read_text())
                 new_items = [item for item in existing2 if item.get("skillName") not in pending_before]
                 for item in new_items:
                     skill_name = item.get("skillName", "unknown")
@@ -433,12 +435,14 @@ def handle_evaluate(body: dict) -> dict:
                     agent_id = body.get("agentId", "jarvis")
                     session_key = body.get("sessionKey", "")
                     last_msg_id = item.get("lastInboundMessageId") or body.get("lastInboundMessageId")
-                    # Send Feishu notification in background thread
-                    threading.Thread(
+                    # Send Feishu notification in tracked thread
+                    t = threading.Thread(
                         target=send_feishu_notification,
                         args=(skill_name, action, tool_count, agent_id, session_key, last_msg_id),
-                        daemon=True,
-                    ).start()
+                    )
+                    t.start()
+                    with _notification_lock:
+                        _notification_threads.append(t)
         except Exception as e:
             log.warning(f"Could not check pending review for notifications: {e}")
 
@@ -468,11 +472,13 @@ class EvaluateHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/health":
             uptime = int(time.time() - start_time)
+            with rate_lock:
+                rate_used = len([t for t in gemini_call_times if time.time() - t < 60])
             self.send_json(200, {
                 "status": "ok",
                 "uptime": uptime,
                 "evaluated": evaluated_count,
-                "rateLimitUsed": len([t for t in gemini_call_times if time.time() - t < 60]),
+                "rateLimitUsed": rate_used,
                 "rateLimitMax": RATE_LIMIT_PER_MIN,
             })
         else:
@@ -487,6 +493,9 @@ class EvaluateHandler(BaseHTTPRequestHandler):
         if content_length == 0:
             self.send_json(400, {"error": "empty body"})
             return
+        if content_length > MAX_BODY_SIZE:
+            self.send_json(413, {"error": f"body too large ({content_length} > {MAX_BODY_SIZE})"})
+            return
 
         try:
             raw = self.rfile.read(content_length)
@@ -495,10 +504,14 @@ class EvaluateHandler(BaseHTTPRequestHandler):
             self.send_json(400, {"error": f"invalid JSON: {e}"})
             return
 
-        # Validate minimum fields
+        # Validate field types
         tool_count = body.get("toolCount", 0)
-        if tool_count < 5:
-            self.send_json(200, {"status": "skipped", "reason": f"toolCount={tool_count} < 5"})
+        if not isinstance(tool_count, (int, float)):
+            self.send_json(400, {"error": "toolCount must be a number"})
+            return
+        tool_count = int(tool_count)
+        if not isinstance(body.get("toolNames", []), list):
+            self.send_json(400, {"error": "toolNames must be an array"})
             return
 
         log.info(f"POST /evaluate: runId={body.get('runId')} toolCount={tool_count} agentId={body.get('agentId')}")
@@ -521,11 +534,27 @@ def main():
         for line in env_file.read_text().splitlines():
             line = line.strip()
             if line and not line.startswith("#") and "=" in line:
+                if line.startswith("export "):
+                    line = line[7:]
                 key, _, val = line.partition("=")
-                os.environ.setdefault(key.strip(), val.strip())
+                val = val.strip().strip('"').strip("'")
+                os.environ.setdefault(key.strip(), val)
         log.info(f"Loaded env from {env_file}")
 
     server = HTTPServer(("127.0.0.1", 8300), EvaluateHandler)
+
+    def graceful_shutdown(signum, frame):
+        log.info(f"Received signal {signum}, shutting down...")
+        # Wait for in-flight notification threads
+        with _notification_lock:
+            threads = list(_notification_threads)
+        for t in threads:
+            t.join(timeout=5)
+        server.shutdown()
+
+    signal.signal(signal.SIGTERM, graceful_shutdown)
+    signal.signal(signal.SIGINT, graceful_shutdown)
+
     log.info("Skill Learner Evaluate Server started on http://127.0.0.1:8300")
     log.info(f"Evaluator script: {EVALUATE_SCRIPT}")
     log.info(f"Queue dir: {QUEUE_DIR}")
@@ -534,6 +563,8 @@ def main():
     try:
         server.serve_forever()
     except KeyboardInterrupt:
+        pass
+    finally:
         log.info("Server stopped.")
 
 if __name__ == "__main__":

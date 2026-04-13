@@ -117,7 +117,7 @@ The `eval_json` fields:
 
 ## Model
 
-`gemini-2.5-flash-preview-04-17` — upgraded from `gemini-3.1-flash-lite-preview`.
+`gemini-3-flash-preview` — upgraded from `gemini-2.5-flash-preview-04-17`.
 
 Flash-lite was cheaper but judgment quality was insufficient for the Skill boundary discrimination task. Flash provides significantly better NO_SKILL / qualify discrimination.
 

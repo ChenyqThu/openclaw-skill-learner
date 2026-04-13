@@ -8,7 +8,7 @@
     <key>ProgramArguments</key>
     <array>
         <string>/opt/homebrew/bin/python3</string>
-        <string>/Users/chenyuanquan/projects/openclaw-skill-learner/scripts/evaluate-server.py</string>
+        <string>/Users/chenyuanquan/Projects/openclaw-skill-learner/scripts/evaluate-server.py</string>
     </array>
 
     <key>RunAtLoad</key>
@@ -32,7 +32,7 @@
     </dict>
 
     <key>WorkingDirectory</key>
-    <string>/Users/chenyuanquan/projects/openclaw-skill-learner</string>
+    <string>/Users/chenyuanquan/Projects/openclaw-skill-learner</string>
 
     <key>ThrottleInterval</key>
     <integer>10</integer>
