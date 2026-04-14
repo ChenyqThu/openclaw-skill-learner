@@ -1,4 +1,13 @@
-# Feishu Notification Card
+# Feishu Notification Cards
+
+三种卡片类型对应三条轨道：
+- 🧠 **Skill 候选卡片** (Track 0) — 新 Skill 审批
+- 🧬 **Skill 进化报告** (Track 1) — Darwin 进化结果
+- 👤 **画像更新建议** (Track 2) — 规范文件更新提案
+
+---
+
+# 🧠 Skill 候选卡片 (Track 0)
 
 ## Card Format
 
@@ -97,3 +106,81 @@ See `messaging-patterns/references/feishu-card-2.0.md` for the full list. Key on
 Cards are only sent when `quality_score.total >= 40`. Skills with lower scores are silently stored in `auto-learned/` without notification. This reduces approval noise — only meaningful skill candidates reach the user's Feishu DM.
 
 The quality score is displayed in the card header (e.g., `🧠 Skill 候选 · 新建 · resilient-pipeline · 67分`) and in the collapsed details panel.
+
+---
+
+# 🧬 Skill 进化报告 (Track 1)
+
+## Structure
+
+```
+Header: 🧬 Skill 进化成功/失败/回退 · {skill_name} · +{delta}
+        green (improved) | orange (reverted) | red (error)
+
+Body:
+  [markdown] 📊 分数变化：{old} → {new} (+{delta})
+  [markdown] 🔍 触发信号 (bullet list of friction signals)
+  [collapsible_panel] 📎 详细维度分数 & Git Diff
+    优化维度, 改动摘要, 轮次, commit hash
+  [form]
+    [column_set]
+      [button primary] ✅ 确认
+      [button danger]  ↩️ 回滚 (with confirm dialog)
+```
+
+## Button Callback
+
+Button name format: `"evo_confirm||base64(skill_name)"` or `"evo_revert||base64(skill_name)"`
+
+Decode:
+```python
+parts = action.name.split("||")
+verb = parts[0]          # evo_confirm | evo_revert
+skill_name = base64.urlsafe_b64decode(parts[1] + "==").decode()
+```
+
+- `evo_confirm`: No-op acknowledgment (commit already made)
+- `evo_revert`: Calls `skill_action.py revert {skill_name}` → git revert
+
+## Trigger Conditions
+
+- Friction weight ≥ 4 (user correction, repeated failure, etc.)
+- Manual trigger: user says "优化 skill X"
+- Batch cron: daily 4:30 AM scans friction log
+
+---
+
+# 👤 画像更新建议 (Track 2)
+
+## Structure
+
+```
+Header: 👤 画像更新建议 · {N} 条
+        blue
+
+Body:
+  [markdown] 📊 分析结果：{N} 条建议
+  [markdown] 提案 1: {target_file} § {section} (action, confidence)
+             建议：...
+             理由：...
+  [markdown] 提案 2: ...
+  [collapsible_panel] 📎 低置信度提案 ({M} 条)
+  [markdown] CLI 审核命令
+```
+
+## Button Callback
+
+Track 2 卡片当前使用 CLI 审核模式（`user_modeling.py --apply/--reject`），
+未来可扩展为卡片内 per-proposal 按钮。
+
+Button name format: `"profile_approve||proposal_id"` or `"profile_reject||proposal_id"`
+
+## Trigger Conditions
+
+- Weekly cron: Monday 5:00 AM
+- Manual: `python3 user_modeling.py --analyze`
+
+## Key Difference from Track 0/1
+
+Track 2 卡片是**批量展示**模式（一张卡片包含多个提案），而非逐个通知。
+这是 KOS 架构决策：不逐条打扰，积累一段时间后一次性展示。
