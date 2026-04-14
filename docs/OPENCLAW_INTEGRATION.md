@@ -1,167 +1,260 @@
-# OpenClaw 侧配合需求 — 三轨道自进化系统
+# OpenClaw 集成指南 — 三轨道自进化系统
 
-本文档定义了三轨道自进化系统对 OpenClaw Jarvis 侧的配合要求。
-技能学习系统作为外部插件运行，但需要 OpenClaw 侧在 **运行指令、日记记录、Session 行为** 上做出配合。
+本文档面向**可复制部署**设计：定义三轨道自进化系统与宿主 AI Agent 平台之间的集成契约。
+无论宿主是 OpenClaw、Hermes 还是其他 Agent 框架，只要满足以下接口约定即可接入。
 
 ---
 
-## 一、AGENTS.md 更新需求（全轨道）
+## 一、系统架构总览
 
-### 问题
-AGENTS.md §六「持续优化与自我进化」目前只写了周回顾 cron 和 VFM 评分，没有反映已运行两周的 Skill Learner 系统。三轨道系统的存在对 Jarvis 的行为有直接影响，必须写入运行指令。
+```
+┌─────────────────────────────────────────────────────────────┐
+│ 宿主 Agent 平台 (e.g., OpenClaw Jarvis)                      │
+│                                                              │
+│  Plugin Hooks (in-process, no network calls)                 │
+│  ├── after_tool_call → 工具计数 + 错误追踪 + Skill 读取检测   │
+│  ├── agent_end → 摩擦/纠正信号检测 + HTTP POST localhost:8300 │
+│  └── session_end → 健康检查 + 兜底队列                        │
+└──────────────────────────┬──────────────────────────────────┘
+                           │ HTTP POST (fire & forget)
+                           ▼
+┌─────────────────────────────────────────────────────────────┐
+│ Skill Learner 评估层 (external process)                      │
+│                                                              │
+│  evaluate-server.py (localhost:8300)                         │
+│  ├── POST /evaluate → Track 0: Skill 候选评估                │
+│  ├── POST /evolve   → Track 1: Darwin 进化触发               │
+│  └── POST /model    → Track 2: 纠正信号收集                  │
+│                                                              │
+│  Scheduled Jobs (launchd / cron / systemd)                   │
+│  ├── 3:30 AM daily  → Track 0: 批量评估兜底                  │
+│  ├── 4:30 AM daily  → Track 1: 批量进化巡检                  │
+│  └── 5:00 AM Mon    → Track 2: 周度用户建模分析               │
+└─────────────────────────────────────────────────────────────┘
+```
 
-### 建议新增内容
+**核心设计原则**：
+1. Plugin 层零网络调用（通过宿主安全扫描）
+2. 评估层完全外部运行（零 context window 成本）
+3. 三轨道共享 Gemini client、HTTP server、飞书卡片基础设施
+4. Track 0/1 自动运行，Track 2 只生成提案（人在回路）
 
-在 AGENTS.md §六 中新增以下段落：
+---
+
+## 二、宿主平台接口契约
+
+### 2.1 必须提供的 Hook 接口
+
+| Hook | 触发时机 | 提供的数据 | 用途 |
+|------|---------|-----------|------|
+| `after_tool_call` | 每次工具调用完成后 | toolName, durationMs, error, params | 工具计数、Skill 读取检测、错误追踪 |
+| `agent_end` | 一轮 Agent 执行结束后 | messages (对话历史数组) | 转录提取、摩擦/纠正信号检测 |
+| `session_end` | 整个会话结束后 | sessionFile (可选) | 健康检查、兜底队列 |
+
+### 2.2 必须提供的文件系统结构
+
+```
+{workspace}/
+├── skills/                    # git-tracked
+│   ├── {skill-name}/
+│   │   ├── SKILL.md           # Track 1 可修改
+│   │   └── test-prompts.json  # Track 1 自动生成
+│   └── auto-learned/          # git-ignored, Track 0 生成
+├── memory/                    # 日记目录
+│   └── YYYY-MM-DD.md          # Track 2 读取
+├── USER.md                    # Track 2 提案目标
+├── SOUL.md                    # Track 2 提案目标 (高风险)
+├── AGENTS.md                  # Track 2 提案目标 + 运行指令
+└── data/skill-learner/        # 运行时数据 (git-ignored)
+    ├── analysis-queue/        # Track 0 待评估队列
+    ├── friction-signals.json  # Track 1 摩擦信号日志
+    ├── correction-signals.json # Track 2 纠正信号日志
+    └── pending-user-updates.json # Track 2 待审提案
+```
+
+### 2.3 必须提供的通知渠道
+
+系统通过 CLI 命令发送通知卡片：
+```bash
+{agent-cli} message send --channel {channel} --target {user} --card {json}
+```
+
+当前实现使用 `openclaw message send --channel feishu`，可替换为任何支持卡片消息的平台。
+
+---
+
+## 三、宿主 Agent 配合义务
+
+### 3.1 运行指令更新 (AGENTS.md)
+
+宿主 Agent 的运行指令中**必须**包含三轨道系统的描述，否则 Agent 不知道自己在被观测和进化。
+
+**最小必要内容**（已写入 OpenClaw AGENTS.md §六）：
 
 ```markdown
 ### 自进化系统（三轨道）
 
-Jarvis 运行着一套外部自进化系统（OpenClaw Skill Learner 插件），通过 Plugin Hook 自动运作：
+运行着外部自进化系统（Skill Learner 插件），通过 Plugin Hook 自动运作：
 
-**轨道 0：Skill 自动提取**
-- Plugin Hook 在每次 agent_end 时自动触发（≥8 次工具调用）
-- 外部 Gemini 评估器判断是否包含可复用模式
-- 候选 Skill 通过飞书卡片通知 Lucien 审批
-- Jarvis 不需要主动做任何事，系统自动运行
+- 轨道 0：agent_end 自动触发 Skill 评估，候选通知审批
+- 轨道 1：摩擦信号触发 Darwin 8 维评分 + 棘轮优化，改进 auto-commit
+- 轨道 2：每周分析日记 + 纠正信号，生成规范文件更新提案
 
-**轨道 1：Skill 自动进化**
-- 当 Jarvis 使用已有 Skill 时出现摩擦（用户纠正、重复失败），系统自动检测
-- 触发 Darwin 8 维评分 + 爬山优化循环
-- 改进自动 git commit，回归自动 git revert（棘轮机制）
-- 进化结果通过飞书卡片汇报，Lucien 可回滚
-
-**轨道 2：用户画像自动更新**
-- 每周一凌晨分析近 7 天日记 + 对话纠正信号
-- Gemini 归因到 USER.md / SOUL.md / AGENTS.md 的具体段落
-- 生成更新提案，通过飞书卡片展示
-- 必须经 Lucien 逐条确认才写入（不自动修改）
-
-**Jarvis 的配合义务**：
-- 日记中记录偏好变化和行为反馈（见下方日记规范）
-- 被用户纠正时，在内部标记为摩擦信号（插件自动处理）
-- 不要手动修改 skills/ 目录下的 .eval.json / .meta.json 文件
+配合义务：
+- 日记中标记 [偏好]/[纠正]/[决策]/[反馈] 四类信号
+- 不手动修改 skills/ 下的 .eval.json / .meta.json
+- 不对 workspace git 执行 reset --hard 或 clean -f
 ```
 
----
+### 3.2 日记信号标记规范
 
-## 二、日记体系配合（主要影响 Track 2）
+Track 2 的归因精度完全依赖日记中的可归因信号。Agent 的日记 cron prompt 必须包含信号提取指令。
 
-### 问题
-Track 2 的归因质量完全依赖日记中是否包含**可归因信号**。纯事件流水账无法触发有效的规范文件更新。
+**四类标记**：
 
-### Jarvis 日记记录规范（建议新增到 AGENTS.md 或日记 cron 指令中）
+| 标记 | 含义 | 示例 |
+|------|------|------|
+| `[偏好]` | 用户表达的新偏好或偏好变更 | `[偏好] Lucien 说不喜欢用表情包` |
+| `[纠正]` | 用户纠正了 Agent 的做法 | `[纠正] 应该先确认再执行，不要自作主张` |
+| `[决策]` | 影响后续工作方式的决策 | `[决策] 从今天起 PR 必须过 CI` |
+| `[反馈]` | 对现有规范文件的反馈 | `[反馈] AGENTS.md 晨报格式太冗长` |
 
-日记中应**刻意记录**以下四类信号（在常规事件记录之外）：
-
-#### 1. 偏好变化信号 `[偏好]`
-当 Lucien 表达了新的偏好或修改了旧偏好时，用 `[偏好]` 标记：
+**日记 cron prompt 追加内容**：
 ```
-[偏好] Lucien 说以后写周报不要用模板，直接写要点就行
-[偏好] Lucien 表示不喜欢 Jarvis 在飞书消息里用表情包
-```
-
-#### 2. 行为纠正信号 `[纠正]`
-当 Lucien 纠正了 Jarvis 的做法时，用 `[纠正]` 标记：
-```
-[纠正] Lucien 说应该先确认再执行，不要自作主张删除文件
-[纠正] 发送消息前应该先给 Lucien 看一遍，这次差点发错
-```
-
-#### 3. 决策记录 `[决策]`
-Lucien 做出的会影响后续工作方式的决策：
-```
-[决策] 从今天起，所有 PR 必须通过 CI 才能合并
-[决策] 不再使用 Notion 管理日程，改用飞书日历
-```
-
-#### 4. 规范反馈 `[反馈]`
-对 SOUL.md / AGENTS.md / USER.md 中现有规则的反馈：
-```
-[反馈] AGENTS.md 里「每日晨报」的格式太冗长了，Lucien 说精简一半
-[反馈] SOUL.md 的沟通风格描述和实际期望不太一致
-```
-
-### 为什么这些标记重要
-Track 2 的 Gemini 归因 prompt 会根据这些标记来：
-1. 判断信号是否已稳定沉淀（同一偏好出现 2+ 次）
-2. 归因到具体文件和段落（USER.md 偏好 vs SOUL.md 风格 vs AGENTS.md 规则）
-3. 过滤掉一次性情绪或临时决定
-
-没有标记的日记内容也会被分析，但归因精度会降低。
-
----
-
-## 三、Track 0 配合（Skill Learning）
-
-### Jarvis 侧无需主动配合
-Plugin Hook 自动运作，无需 Jarvis 改变行为。但有以下注意点：
-
-1. **不要手动修改 `skills/auto-learned/` 目录**
-   - 候选 Skill 由系统生成，通过飞书卡片审批
-   - 审批后自动移入 `skills/` 正式目录
-
-2. **SKILL.md 读取会被追踪**
-   - 当 Jarvis 读取某个 SKILL.md 时，插件会记录
-   - 这是 dedup 和 Track 1 摩擦检测的信号源
-
-3. **evaluate-server 必须持续运行**
-   - `http://127.0.0.1:8300` 接收实时评估请求
-   - 如果 server 不可达，请求会降级到 3:30 AM 批量处理
-
----
-
-## 四、Track 1 配合（Darwin Evolution）
-
-### Jarvis 侧无需主动配合
-摩擦信号由 Plugin Hook 自动检测。但有以下影响点：
-
-1. **用户纠正会触发进化**
-   - 当 Lucien 说"不对/错了/wrong"等，且当前使用了某个 Skill
-   - 系统会自动触发该 Skill 的 Darwin 进化循环
-
-2. **手动触发**
-   - Lucien 说"优化 skill X"会强制触发进化
-   - 这不需要 Jarvis 做任何额外处理（Plugin 自动检测）
-
-3. **workspace git 已初始化**
-   - `~/.openclaw/workspace/` 现在是 git 仓库
-   - 只追踪 `skills/*/SKILL.md` 和核心规范文件
-   - Jarvis 不应对此目录执行 `git reset` 或 `git clean`
-
----
-
-## 五、Track 2 配合（User Modeling）
-
-### Jarvis 日记 cron 需要调整
-
-当前日记 cron 如果只是事件记录，需要增加上述四类信号的自动提取。
-
-**建议**：在日记 cron 的 system prompt 中增加：
-```
-在记录完当天事件后，额外审视以下维度：
-1. Lucien 今天表达了什么新偏好？用 [偏好] 标记
-2. Lucien 纠正了 Jarvis 什么做法？用 [纠正] 标记
-3. 有什么会影响后续工作方式的决策？用 [决策] 标记
+在记录完当天事件后，必须审视以下维度并追加「## 自进化信号」章节：
+1. 用户今天表达了什么新偏好？用 [偏好] 标记
+2. 用户纠正了 Agent 什么做法？用 [纠正] 标记
+3. 有什么影响后续工作方式的决策？用 [决策] 标记
 4. 对现有规范文件有什么反馈？用 [反馈] 标记
-
 如果某个维度没有，就不写。不要编造。
 ```
 
-### 对话层纠正信号自动采集
+### 3.3 Workspace Git 维护
 
-Plugin 已自动检测对话中的纠正关键词（"不对/错了/应该/wrong"），并将上下文保存到 `correction-signals.json`。这部分不需要 Jarvis 配合。
+Track 1 棘轮依赖 git。宿主需要：
+- 新增 Skill 后运行 `git add skills/*/SKILL.md && git commit`
+- 不对 workspace 执行 `git reset --hard` 或 `git clean -f`
+- 定期检查未追踪的新 skill 目录
 
 ---
 
-## 六、部署检查清单
+## 四、部署检查清单
 
-| 项 | 状态 | 操作 |
-|---|------|------|
-| AGENTS.md 更新 | ❌ 未做 | 将上述内容写入 §六 |
-| evaluate-server 重启 | ❌ 未做 | `launchctl unload + load` server plist |
-| evolution cron 安装 | ❌ 未做 | `cp ai.openclaw.skill-evolution-cron.plist ~/Library/LaunchAgents/ && launchctl load ...` |
-| user-modeling cron 安装 | ❌ 未做 | `cp ai.openclaw.user-modeling-cron.plist ~/Library/LaunchAgents/ && launchctl load ...` |
-| 日记 cron prompt 更新 | ❌ 未做 | 增加四类信号标记指令 |
-| Plugin 同步 | ✅ 已做 | `~/.openclaw/plugins/jarvis-skill-learner/index.js` 已更新 |
-| workspace git | ✅ 已做 | 21 个 SKILL.md + 3 个核心文件已追踪 |
+### 4.1 首次部署
+
+| # | 项 | 命令 | 验证 |
+|---|---|------|------|
+| 1 | 安装 Plugin | `openclaw plugins install ./plugin` | 重启后 console 输出 `[skill-learner] Plugin registered` |
+| 2 | 配置环境变量 | 写入 `~/.openclaw/.env`: GEMINI_API_KEY, FEISHU_APP_ID, FEISHU_APP_SECRET | `echo $GEMINI_API_KEY` 有值 |
+| 3 | 初始化 workspace git | `bash scripts/init-workspace-git.sh` | `cd ~/.openclaw/workspace && git log` 有 initial commit |
+| 4 | 启动 evaluate-server | `launchctl load ~/Library/LaunchAgents/ai.openclaw.skill-learner-server.plist` | `curl localhost:8300/health` 返回 ok |
+| 5 | 安装 Track 0 批量 cron | `cp ai.openclaw.skill-learner.plist ~/Library/LaunchAgents/ && launchctl load ...` | — |
+| 6 | 安装 Track 1 进化 cron | `cp ai.openclaw.skill-evolution-cron.plist ~/Library/LaunchAgents/ && launchctl load ...` | — |
+| 7 | 安装 Track 2 建模 cron | `cp ai.openclaw.user-modeling-cron.plist ~/Library/LaunchAgents/ && launchctl load ...` | — |
+| 8 | 同步 Plugin | `cp plugin/index.js ~/.openclaw/plugins/jarvis-skill-learner/` | — |
+| 9 | 更新 AGENTS.md | 写入三轨道运行指令（见 §3.1） | Agent review 能看到 |
+| 10 | 更新日记 cron prompt | 注入四类信号标记指令（见 §3.2） | 次日日记包含 `## 自进化信号` |
+
+### 4.2 当前部署状态 (OpenClaw Jarvis, 2026-04-14)
+
+| # | 项 | 状态 | 备注 |
+|---|---|------|------|
+| 1 | Plugin 安装 | ✅ | Phase 2 起已运行 |
+| 2 | 环境变量 | ✅ | GEMINI_API_KEY + FEISHU credentials |
+| 3 | workspace git | ✅ | 21+ SKILL.md + 核心文件，含 context-doctor/figma 等新 skill |
+| 4 | evaluate-server | ✅ | 运行中，uptime 52794s |
+| 5 | Track 0 cron | ✅ | 3:30 AM daily |
+| 6 | Track 1 cron | ✅ | 4:30 AM daily (2026-04-14 加载) |
+| 7 | Track 2 cron | ✅ | Mon 5:00 AM (2026-04-14 加载) |
+| 8 | Plugin 同步 | ✅ | Phase 3 版本含摩擦+纠正信号 |
+| 9 | AGENTS.md | ✅ | §六 已写入三轨道描述 + 配合义务 |
+| 10 | 日记 cron prompt | ✅ | 已注入四类信号 + 回溯补标 5 天 (04-08~04-13) |
+
+---
+
+## 五、可复制部署指南
+
+### 5.1 适配到其他 Agent 平台
+
+本系统设计为**平台无关**，适配需要修改以下组件：
+
+| 组件 | 需要适配的部分 | 工作量 |
+|------|--------------|--------|
+| `plugin/index.js` | Hook 注册方式（`definePluginEntry` → 目标平台 SDK） | 中 |
+| `evaluate-server.py` | 通知发送（`openclaw message send` → 目标平台 CLI/API） | 小 |
+| `skill_action.py` | 卡片回调处理（飞书 Card 2.0 → 目标平台卡片格式） | 中 |
+| `gemini_client.py` | 可替换为 Claude/GPT API | 小 |
+| plist 文件 | macOS launchd → Linux systemd / cron | 小 |
+
+**不需要修改**：`skill_evolution.py`、`user_modeling.py`、`eval-benchmark.py`、`darwin-optimize.py`。这些是纯逻辑层，不依赖具体平台。
+
+### 5.2 最小可行部署 (MVP)
+
+如果只需要 Track 0（Skill 学习），最小部署为：
+1. Plugin Hook 注册 (`after_tool_call` + `agent_end`)
+2. `evaluate-server.py` 运行
+3. `skill-learner-evaluate.py` + `gemini_client.py`
+4. Gemini API key
+
+Track 1 和 Track 2 是增量功能，可以在 Track 0 稳定后逐步启用。
+
+### 5.3 环境要求
+
+| 依赖 | 版本 | 用途 |
+|------|------|------|
+| Python | 3.12+ | 评估层（使用 `str \| None` 类型语法） |
+| Node.js | 18+ | Plugin 层（ESM） |
+| git | 2.x | Track 1 棘轮机制 |
+| Gemini API | gemini-3-flash-preview | 评估 + 进化 + 归因 |
+| 通知渠道 | 飞书 / Slack / Discord | 审批卡片（可选） |
+
+---
+
+## 六、安全边界
+
+| 约束 | 实现方式 | 为什么 |
+|------|---------|--------|
+| Plugin 零网络调用 | 所有 HTTP 通过 localhost:8300 | 通过宿主安全扫描 |
+| Track 1 只改 SKILL.md | `SkillEvolver` 硬编码 blocklist | SOUL/AGENTS/USER 是高风险文件 |
+| Track 1 只改已批准 Skill | 拒绝 `auto-learned/` 路径 | 未审批的草稿不应被进化 |
+| Track 2 不 auto-commit | `apply_proposal()` 只写文件 | 核心文件修改必须人工确认 |
+| git 操作用 revert 不用 reset | `git revert HEAD --no-edit` | 保留完整历史，可追溯 |
+| 进化频率限制 | 2 次/小时 | 防止 Gemini API 成本失控 |
+
+---
+
+## 七、监控与故障排查
+
+### 日志文件
+
+| 文件 | 内容 |
+|------|------|
+| `data/skill-learner/server.log` | evaluate-server 请求日志 |
+| `data/skill-learner/evaluate.log` | Track 0 批量评估日志 |
+| `data/skill-learner/evolution.log` | Track 1 进化日志 |
+| `data/skill-learner/user-modeling.log` | Track 2 建模日志 |
+
+### 健康检查
+
+```bash
+# Server 状态
+curl http://127.0.0.1:8300/health
+
+# Track 1: 查看 eligible skills
+python3 scripts/skill_evolution.py --list
+
+# Track 2: 查看待审提案
+python3 scripts/user_modeling.py --status
+
+# Workspace git 状态
+cd ~/.openclaw/workspace && git status && git log --oneline -5
+```
+
+### 常见问题
+
+| 问题 | 原因 | 解决 |
+|------|------|------|
+| evaluate-server 无响应 | 进程挂掉 | `launchctl unload + load` server plist |
+| Track 1 无进化记录 | 无摩擦信号 or cron 未加载 | 检查 `friction-signals.json` + `launchctl list` |
+| Track 2 无提案 | 日记缺少标记 or cron 未跑 | 检查日记 `## 自进化信号` + cron log |
+| Skill 进化失败 | workspace git 脏状态 | `cd workspace && git status`，解决冲突 |
