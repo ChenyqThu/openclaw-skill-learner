@@ -10,45 +10,78 @@ Hermes captures two essential signals:
 1. **Trial and error / course correction** — hard-won knowledge, not obvious upfront
 2. **User corrected the agent** — the agent would repeat the mistake without documenting it
 
-Our prompt extends this with structured output and OpenClaw-specific context.
+Our prompt extends this with structured output, OpenClaw-specific context, a mandatory Deviation Test, and quality scoring. The prompt is versioned and optimized using a Darwin-style hill-climbing approach.
 
 ---
 
-## New Skill Prompt Structure
+## Prompt Versions
+
+| Version | Score | Key changes |
+|---------|-------|-------------|
+| v1_baseline | 66.6/100 | Original prompt from Phase 2, no system context |
+| v2_recall_dedup | 65.7/100 | +recall (pattern focus, debugging examples), -precision (too aggressive) |
+| **v3_balanced** | **88.9/100** | +Deviation Test, +false positive guards, balanced recall/precision |
+
+Prompts are stored in `scripts/prompts/` and loaded via `PROMPT_VERSION` env var.
+
+---
+
+## New Skill Prompt Structure (v3)
 
 ```
-[OpenClaw Skill definition]
-  What a Skill IS: reusable agent behavioral pattern
-  What a Skill is NOT: one-time code fix, script optimization
+[System Context — NEW in v3]
+  OpenClaw description: AI agent orchestration platform
+  Jarvis: primary agent, Feishu-accessible
+  Session types: direct conversations, cron tasks, subagent spawning
+  Tool set: exec, read/write/edit, process, sessions_*, web_fetch, feishu_*, etc.
+
+[Pattern Focus — NEW in v3]
+  "Focus on the PATTERN, not the surface context"
+  Even debugging sessions can reveal reusable orchestration patterns
+  Examples: launchd service → "diagnosing background service env issues"
 
 [Session data]
-  Tool count + names
-  User messages (up to 8)
-  Agent responses (up to 8)
+  Tool count + names + skillsUsed (dedup signal)
+  User messages + Agent responses
 
-[Existing skills list]
-  name: one-line description
-  (for dedup — Gemini avoids creating duplicates)
+[Existing skills list → dedup]
 
-[Hermes core test]
-  "Did this require trial and error / changing course / user correction?"
+[Hermes core test + self-correction signals]
+  Trial-and-error keywords + Chinese self-correction: "操", "我想简单了", "想错了"
 
 [Qualification criteria A+B + one of C-E]
-  A: reusable across ≥2 future contexts
-  B: agent workflow pattern (not "fix script X")
-  C: required non-obvious T&E
-  D: specific tool combos / pitfalls
-  E: user corrected agent
+  A: PATTERN reusable across ≥2 contexts (not the specific fix)
+  B: agent workflow orchestration (approach transfers to other scenarios)
+  C-E: trial-and-error / tool combos / user correction
+
+[Deviation Test — NEW in v3, mandatory]
+  Must identify a specific DEVIATION moment in the session
+  No deviation = NO_SKILL
+  Examples: tried A → failed → switched to B; discovered unexpected pitfall
 
 [Red flags → NO_SKILL]
-  "add error handling to script X" → fix the script
-  pattern only applies to one file/cron/config
-  obvious or duplicates existing skill
+  Trivial one-off fix
+  Cron that followed instructions without deviation
+  Standard data pipeline with no surprises
+  Agent merely synced data without obstacles
+
+[Examples — expanded in v3]
+  Example 1: PDF parsing (trial-and-error → QUALIFIES)
+  Example 2: Notification debugging (pattern extraction from fix → QUALIFIES)
+  Example 3: Cron data collection with failures (resilient pattern → QUALIFIES)
+  Example 4: Config typo fix (trivial → NO_SKILL)
+  Example 5: Daily journal cron, no deviation (routine → NO_SKILL)
+
+[Reasoning steps — updated in v3]
+  (1) What is the underlying PATTERN?
+  (2) DEVIATION TEST: quote the specific moment
+  (3) Reusable across ≥2 contexts?
+  (4) Which of C, D, E apply?
 
 [Output format]
   NO_SKILL  (if not qualified)
   OR:
-  ```eval_json  → structured evaluation data
+  ```eval_json  → structured data + quality_score (0-100)
   ```skill_md   → SKILL.md content
 ```
 
@@ -76,17 +109,30 @@ Same Hermes core test, but focused on gap detection:
 
 ## Pre-filter (before calling Gemini)
 
-Sessions with `toolCount < 8` AND no user correction signal are skipped:
+**Phase 3 (data-driven)**: Replaced the keyword-based heuristic with feature analysis derived from 41 historical sessions. Designed for 0% false negative rate:
 
 ```python
-correction_keywords = ["不对", "不是", "错了", "应该", "重新",
-                       "no,", "actually", "wait", "wrong", "instead"]
-has_correction = any(kw in msg.lower() for msg in user_messages
-                     for kw in correction_keywords)
+def should_skip_session(request: dict) -> str | None:
+    asst_texts = request.get("assistantTexts", [])
+    total_asst_chars = sum(len(t) for t in asst_texts)
 
-if tool_count < 8 and not has_correction:
-    skip()  # ~60% API savings
+    # Signal 1: Very short assistant output — not enough substance
+    if total_asst_chars < 100:
+        return f"asst_chars={total_asst_chars} < 100"
+
+    # Signal 2: Single tool type + no user messages = simple subagent execution
+    tool_types = set(request.get("toolNames", []))
+    user_msgs = request.get("userMessages", [])
+    if len(tool_types) <= 1 and len(user_msgs) == 0 and request.get("toolCount", 0) < 10:
+        return f"single_tool_no_user"
+
+    return None  # proceed to Gemini
 ```
+
+**Why not keyword-based?** Analysis of 41 sessions showed:
+- `toolCount` doesn't discriminate (both completed and no_update averaged ~15)
+- Correction keywords appeared in only 2/41 sessions (too rare to be useful)
+- `asst_chars < 100` perfectly separates low-signal sessions (0% false negatives)
 
 ---
 
@@ -112,6 +158,41 @@ The `eval_json` fields:
 | `when_to_use` | Card: 📋 适用场景 |
 | `key_patterns` | Card: 关键模式 |
 | `pitfalls` / `new_pitfalls` | Card: 已知雷区 |
+| `quality_score` | Quality gate + card header badge |
+
+### Quality Score (new in Phase 3)
+
+```json
+"quality_score": {
+  "reusability": 8,       // ×25
+  "insight_depth": 7,     // ×25
+  "specificity": 6,       // ×20
+  "pitfall_coverage": 5,  // ×15
+  "completeness": 7,      // ×15
+  "total": 67             // weighted sum
+}
+```
+
+Used by `evaluate-server.py` to gate notifications:
+- `total ≥ 40`: Send Feishu Card 2.0 notification
+- `total < 40`: Silently store draft, no notification
+
+---
+
+## Darwin Optimization Framework
+
+The prompt is optimized using `scripts/eval-benchmark.py` and `scripts/darwin-optimize.py`:
+
+1. **Labeled test set**: 18 sessions in `scripts/test-cases/` (8 extract + 6 reject + 4 update)
+2. **6-dimension scoring**: accuracy (×35), precision (×20), recall (×15), quality (×15), dedup (×10), robustness (×5)
+3. **Hill-climbing**: diagnose weakest dimension → targeted edit → re-evaluate → keep/revert
+4. **Ratchet**: scores only go up; failed attempts are reverted
+
+```bash
+python3 scripts/eval-benchmark.py                    # run benchmark
+python3 scripts/eval-benchmark.py --prompt v3_balanced  # specific version
+python3 scripts/darwin-optimize.py --max-rounds 5    # auto-optimize
+```
 
 ---
 

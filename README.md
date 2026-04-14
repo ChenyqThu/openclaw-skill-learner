@@ -4,7 +4,8 @@
 
 An OpenClaw plugin that brings Hermes-style self-evolution to the OpenClaw ecosystem — without modifying OpenClaw's source code.
 
-> **Current Version**: Phase 2 (real-time evaluation + rich Feishu Card 2.0 approval)
+> **Current Version**: Phase 3 (Darwin-style prompt optimization + quality scoring)
+> **Evaluation Accuracy**: 88.9/100 (v3 prompt, 16/18 correct on labeled test set)
 > **Full project doc**: [OpenClaw Skill Learner — 项目文档 & 实现全记录](https://www.feishu.cn/wiki/OqW8wQhj6iJbZnkbMxWcNzLgnlb)
 
 ---
@@ -24,18 +25,24 @@ Your conversations with Jarvis
                    │  localhost:8300                  │  run-skill-learner.sh
                    └────────────────┬────────────────┘
                                     │
-                        Gemini 2.5 Flash API
-                        (structured eval_json + skill_md)
+                        Gemini 3 Flash API
+                        (structured eval_json + skill_md + quality_score)
+                                    │
+                              Pre-filter (data-driven)
+                              + Deviation Test (v3 prompt)
                                     │
                     ┌───────────────┼───────────────┐
                     │               │               │
               New Skill?     Update Skill?      NO_SKILL
+              + quality_score   + quality_score
                     │               │
           skills/auto-learned/  .update-proposal.md
           + .eval.json            + .eval.json
                     │               │
+              Quality gate: ≥40 → notify, <40 → silent store
+                    │               │
               Feishu Card 2.0 interactive notification
-              (problem → approach → scenarios → pitfalls)
+              (problem → approach → scenarios → quality score)
                     │
           [✅ 通过落地] [💬 方案优化讨论] [⏭ 跳过]
 ```
@@ -63,12 +70,16 @@ Evaluation prompt inspired by Hermes `_SKILL_REVIEW_PROMPT`. Core test:
 - **D**: Contains specific tool combos, parameters, or pitfalls worth documenting
 - **E**: User corrected the agent's method
 
-**Red flags → NO_SKILL**:
-- "Add error handling/retry to script X" → fix the script directly
-- Pattern only applies to one specific file/cron/config
-- Approach is obvious or already covered by an existing skill
+**Deviation Test** (v3, mandatory): Gemini must identify a specific moment where the agent deviated from the expected path (tried A → failed → switched to B, self-corrected, user corrected). No deviation = NO_SKILL.
 
-**Pre-filter**: Sessions with `toolCount < 8` and no user correction signal are skipped before calling Gemini (~60% API savings).
+**Red flags → NO_SKILL**:
+- Pattern only applies to one specific file/config AND the approach is trivial
+- Cron task that followed its instructions step-by-step without encountering obstacles
+- Standard data read → format → output pipeline with no surprises
+
+**Pre-filter** (data-driven): Sessions with `asst_chars < 100` or single-tool-type subagent sessions are skipped (0% false negative rate).
+
+**Quality scoring**: Gemini outputs `quality_score` (0-100) based on 5 dimensions: reusability, insight depth, specificity, pitfall coverage, completeness. Score < 40 → silently stored without notification.
 
 **Dedup**: Existing installed skills are injected into the prompt so Gemini can avoid creating duplicates.
 
@@ -78,11 +89,11 @@ When a skill candidate is found, a structured interactive card is sent:
 
 | Section | Content |
 |---------|---------|
-| Header | `🧠 Skill 候选 · 新建/更新 · {skill_name}` (orange/blue) |
+| Header | `🧠 Skill 候选 · 新建/更新 · {skill_name} · {quality_score}分` (orange/blue) |
 | Body | 🔍 问题发现 + 💡 推荐方案 |
 | Scenarios | 📋 适用场景 (bullet list) |
 | Patterns | 关键模式 + 已知雷区 |
-| Details | Collapsed grey panel: source, session, tool count |
+| Details | Collapsed grey panel: source, session, tool count, quality score |
 | Input | `multiline_text` input for optimization suggestions |
 | Buttons | ✅ 通过落地 · 💬 方案优化讨论 · ⏭ 跳过 |
 
@@ -166,7 +177,14 @@ python3 scripts/skill-learner-evaluate.py --dry-run  # preview only
 | Constant | Default | Description |
 |----------|---------|-------------|
 | `GEMINI_MODEL` | `gemini-3-flash-preview` | Gemini model for evaluation |
-| `TOOL_CALL_THRESHOLD` | `8` (plugin) | Minimum tool calls to trigger evaluation |
+| `PROMPT_VERSION` | (env var) | Pluggable prompt version (e.g., `v3_balanced`) |
+
+### Quality Gate Thresholds
+
+| Score Range | Behavior |
+|-------------|----------|
+| `≥ 40` | Normal notification via Feishu Card 2.0 |
+| `< 40` | Silently stored, no notification (reduces approval noise) |
 
 ---
 
@@ -179,10 +197,22 @@ plugin/
 └── openclaw.plugin.json
 
 scripts/
-├── skill-learner-evaluate.py         # Batch evaluator (Gemini API)
+├── skill-learner-evaluate.py         # Batch evaluator (Gemini API + quality scoring)
 ├── evaluate-server.py                # Real-time eval microservice (localhost:8300)
+├── eval-benchmark.py                 # Darwin benchmark: 6-dimension scoring framework
+├── darwin-optimize.py                # Hill-climbing optimizer (ratchet mechanism)
 ├── run-skill-learner.sh              # Wrapper for cron/launchd
-└── state-arc-analyzer.py             # User state arc analysis (Phase 2D)
+├── state-arc-analyzer.py             # User state arc analysis (Phase 2D)
+├── prompts/                          # Pluggable prompt versions
+│   ├── v1_baseline.py                #   Original prompt (baseline)
+│   ├── v2_recall_dedup.py            #   Recall + dedup improvements
+│   └── v3_balanced.py                #   Production prompt (88.9/100)
+├── test-cases/                       # Labeled test dataset (18 cases)
+│   ├── should-extract/               #   Ground truth = YES (8 cases)
+│   ├── should-reject/                #   Ground truth = NO (6 cases)
+│   └── should-update/                #   Ground truth = UPDATE (4 cases)
+└── darwin-results/                   # Optimization history + cached API results
+    └── results.tsv                   #   Score tracking (darwin-skill compatible)
 
 ai.openclaw.skill-learner.plist       # launchd: batch evaluator (3:30 AM)
 ai.openclaw.skill-learner-server.plist # launchd: real-time server (persistent)
@@ -248,12 +278,56 @@ skill_action = parts[2]    # "create" | "update"
 
 ---
 
+## Darwin Prompt Optimization
+
+Evaluation prompts are optimized using a Darwin-style hill-climbing approach (inspired by [darwin-skill](https://github.com/alchaincyf/darwin-skill)):
+
+```bash
+# Run benchmark on current prompt
+python3 scripts/eval-benchmark.py
+
+# Run with a specific prompt version
+python3 scripts/eval-benchmark.py --prompt v3_balanced
+
+# Run full optimization loop (auto hill-climbing)
+python3 scripts/darwin-optimize.py --max-rounds 5
+
+# Preview without API calls (uses cached results)
+python3 scripts/eval-benchmark.py --dry-run
+```
+
+**6-Dimension Scoring** (total 100):
+
+| Dimension | Weight | Description |
+|-----------|--------|-------------|
+| Accuracy | 35 | Correct YES/NO/UPDATE classification |
+| Precision | 20 | Of predicted YES, how many are correct |
+| Recall | 15 | Of actual YES, how many detected |
+| Quality | 15 | eval_json completeness + skill_md usability |
+| Dedup | 10 | Doesn't duplicate existing skills |
+| Robustness | 5 | Output format parse success rate |
+
+**Optimization History**:
+
+| Version | Score | Key Change |
+|---------|-------|------------|
+| v1_baseline | 66.6 | Original prompt from Phase 2 |
+| v2_recall_dedup | 65.7 | +recall but -precision (too aggressive) |
+| v3_balanced | **88.9** | +Deviation Test, +pattern focus, +false positive guards |
+
+**Ratchet mechanism**: Scores only go up. Each improvement attempt must beat the current best or gets reverted.
+
+---
+
 ## Roadmap
 
 - [ ] **Card action handler**: Implement `card_action` plugin hook to handle button clicks (approve/discuss/skip) directly without text reply
 - [ ] **SCAN layer**: Embed security scan into eval pipeline
 - [ ] **User modeling**: Detect preference signals in `session_end` hook, auto-propose USER.md updates
 - [ ] **Fallback model**: Automatic Gemini model fallback on rate limits
+- [x] ~~**Darwin optimization**: Prompt hill-climbing with labeled test set~~ (done: v3, 88.9/100)
+- [x] ~~**Quality scoring**: 0-100 score driving notification strategy~~ (done: quality_score in eval_json)
+- [x] ~~**Data-driven pre-filter**: Replace keyword heuristic with feature analysis~~ (done: 0% false negative)
 
 ---
 

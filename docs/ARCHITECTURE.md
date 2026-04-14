@@ -51,16 +51,21 @@ This separation is required by OpenClaw's security scanner, which blocks network
 ┌─────────────────────────────────────────────────────┐
 │ skill-learner-evaluate.py                            │
 │                                                      │
-│  Pre-filter: toolCount < 8 + no user correction?     │
-│    → skip (save ~60% Gemini API calls)               │
+│  Pre-filter (data-driven):                           │
+│    asst_chars < 100 → skip                           │
+│    single-tool + no user msgs → skip                 │
+│                                                      │
+│  Pluggable prompt (PROMPT_VERSION env var):           │
+│    v1_baseline → v2_recall_dedup → v3_balanced       │
 │                                                      │
 │  Related skill? (hook signal > topic heuristic)      │
 │    YES → build_update_skill_prompt()                 │
 │    NO  → build_new_skill_prompt()                    │
 │                                                      │
-│  Call Gemini 3 Flash                                 │
-│    → parse eval_json block (problem/approach/etc.)   │
+│  Call Gemini 3 Flash (with Deviation Test)            │
+│    → parse eval_json (problem/approach/quality_score) │
 │    → parse skill_md block                            │
+│    → quality_score < 40 → silent store (no notify)   │
 │    → write SKILL.md + .meta.json + .eval.json        │
 └──────────────────┬──────────────────────────────────┘
                    │ reads .eval.json
@@ -68,10 +73,10 @@ This separation is required by OpenClaw's security scanner, which blocks network
 ┌─────────────────────────────────────────────────────┐
 │ Feishu Card 2.0 Notification                         │
 │                                                      │
-│  Header: 🧠 Skill 候选 · {action} · {name}           │
+│  Header: 🧠 Skill 候选 · {action} · {name} · {score}│
 │  Body:   问题发现 + 推荐方案                          │
 │          适用场景 + 关键模式 + 已知雷区               │
-│          [折叠] 来源 & Session 详情                   │
+│          [折叠] 来源 & Session 详情 + 质量评分        │
 │  Form:   multiline 优化建议输入框                     │
 │  Buttons: ✅ 通过落地 / 💬 方案优化讨论 / ⏭ 跳过    │
 │                                                      │
@@ -131,40 +136,66 @@ A Skill is a **reusable agent behavioral pattern** — NOT a one-time code fix.
 
 Core test (from Hermes): *"Did this require trial and error, changing course, or user correction?"*
 
-Red flags that disqualify a session from generating a Skill:
-- "Add error handling to script X" → fix the script directly
-- Pattern only applies to one specific file/cron/config
-- Approach is obvious or duplicates an existing Skill
+**Deviation Test** (v3): The prompt requires Gemini to identify a specific moment where the agent deviated from the expected path. Focus on the underlying PATTERN, not the surface context — even debugging sessions can reveal reusable orchestration patterns.
 
-The evaluator prompt injects the existing Skills list for dedup, and applies a `toolCount < 8` pre-filter to skip low-signal sessions.
+Red flags that disqualify a session from generating a Skill:
+- Pattern only applies to one specific file/config AND the approach is trivial
+- Cron task that followed instructions step-by-step without encountering obstacles
+- Standard data read → format → output pipeline with no surprises
+
+### Quality scoring
+
+Gemini outputs `quality_score` (0-100) based on 5 weighted dimensions:
+- **reusability** (×25): Can this pattern apply across different contexts?
+- **insight_depth** (×25): How far beyond the obvious does it go?
+- **specificity** (×20): Are the steps concrete and actionable?
+- **pitfall_coverage** (×15): Are edge cases and failure modes documented?
+- **completeness** (×15): Does the SKILL.md cover all sections?
+
+Skills with `quality_score < 40` are silently stored without Feishu notification, reducing approval noise.
+
+### Pluggable prompts
+
+Prompt versions are stored in `scripts/prompts/` and selected via `PROMPT_VERSION` env var. This enables Darwin-style optimization: test a new prompt version against labeled data, keep it only if scores improve.
+
+| Version | Score | Key change |
+|---------|-------|------------|
+| v1_baseline | 66.6 | Original prompt |
+| v2_recall_dedup | 65.7 | +recall, -precision |
+| v3_balanced | **88.9** | +Deviation Test, +pattern focus |
 
 ---
 
 ## Gemini Prompt Design
 
-Inspired by Hermes `_SKILL_REVIEW_PROMPT` but more structured:
+Inspired by Hermes `_SKILL_REVIEW_PROMPT` but more structured. See [GEMINI_PROMPT.md](GEMINI_PROMPT.md) for full details.
 
 ```
-[Context]
-WHAT IS AN OPENCLAW SKILL — boundary definition
-Hermes core test: trial and error / user corrected
+[System Context]
+  OpenClaw/Jarvis description, tool set, session types
 
-[Criteria]
-A: reusable across ≥2 contexts
-B: agent workflow pattern (not script fix)
-C: non-obvious to discover
-D: specific tool combos / pitfalls
-E: user corrected agent
+[Pattern Focus]
+  Focus on PATTERN not surface context
+  Even debugging can reveal reusable patterns
 
-[Red flags → NO_SKILL]
+[Criteria A-E]
+  A: PATTERN reusable ≥2 contexts
+  B: agent workflow (approach transfers)
+  C-E: trial-and-error / tool combos / user correction
+
+[Deviation Test — mandatory]
+  Must identify specific deviation moment
+  No deviation = NO_SKILL
+
+[Red flags + false positive guards]
 [Existing skills list → dedup]
 
 [Output format]
-```eval_json → structured evaluation data
-```skill_md  → SKILL.md content
+  eval_json → structured data + quality_score
+  skill_md  → SKILL.md content
 ```
 
-The `eval_json` block populates the notification card fields. The `skill_md` block becomes the actual SKILL.md file. Both are written to disk for later inspection.
+The `eval_json` block populates the notification card and includes `quality_score` for filtering. The `skill_md` block becomes the SKILL.md file.
 
 ---
 
@@ -176,3 +207,4 @@ The `eval_json` block populates the notification card fields. The `skill_md` blo
 | 2 (Real-time) | 2026-04-12 | evaluate-server microservice + localhost HTTP trigger |
 | 2D (State arc) | 2026-04-12 | state-arc-analyzer.py + user modeling signals |
 | Card redesign | 2026-04-12 | Feishu Card 2.0 + Gemini prompt upgrade |
+| 3 (Darwin) | 2026-04-13 | Darwin-style prompt optimization (66.6→88.9), quality scoring, pluggable prompts, data-driven pre-filter |

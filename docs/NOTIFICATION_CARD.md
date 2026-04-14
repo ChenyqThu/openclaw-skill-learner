@@ -7,15 +7,16 @@ Feishu Card 2.0 (`schema: "2.0"`) is required for `input` + `form` support.
 ## Structure
 
 ```
-Header: 🧠 Skill 候选 · 新建/更新 · {skill_name}
+Header: 🧠 Skill 候选 · 新建/更新 · {skill_name} · {quality_score}分
         orange (new) | blue (update)
+        quality_score displayed if > 0
 
 Body:
   [markdown] 🔍 问题发现 + 💡 推荐方案
   [markdown] 📋 适用场景 (bullet list, up to 5)
   [markdown] 关键模式 + 已知雷区 (if available)
   [collapsible_panel] grey · 📎 来源 & Session 详情
-    source agent, session key, tool count, tool names
+    source agent, session key, tool count, tool names, quality score
 
   [form]
     [input] 💬 优化建议
@@ -39,6 +40,14 @@ Card content is populated from `.eval.json` written by the evaluator:
   "when_to_use": ["...", "..."],
   "key_patterns": ["...", "..."],
   "pitfalls": ["...", "..."],
+  "quality_score": {
+    "reusability": 8,
+    "insight_depth": 7,
+    "specificity": 6,
+    "pitfall_coverage": 5,
+    "completeness": 7,
+    "total": 67
+  },
   "toolNames": ["..."],
   "lastInboundMessageId": "om_xxx"
 }
@@ -82,3 +91,9 @@ See `messaging-patterns/references/feishu-card-2.0.md` for the full list. Key on
 - Multi-line input: `input_type: "multiline_text"` (not `multiline: true`)
 - Left-aligned buttons: `column width: "auto"` (not `"weighted"`)
 - Form submit callback has no `action.value` — encode metadata in `action.name`
+
+## Quality Gate
+
+Cards are only sent when `quality_score.total >= 40`. Skills with lower scores are silently stored in `auto-learned/` without notification. This reduces approval noise — only meaningful skill candidates reach the user's Feishu DM.
+
+The quality score is displayed in the card header (e.g., `🧠 Skill 候选 · 新建 · resilient-pipeline · 67分`) and in the collapsed details panel.
