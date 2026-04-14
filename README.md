@@ -1,11 +1,12 @@
 # 🧠 OpenClaw Skill Learner
 
-**Auto-learn reusable skills from complex agent sessions.**
+**Auto-learn and self-evolve reusable skills from agent sessions.**
 
-An OpenClaw plugin that brings Hermes-style self-evolution to the OpenClaw ecosystem — without modifying OpenClaw's source code.
+An OpenClaw plugin that brings Hermes-style self-evolution to the OpenClaw ecosystem — without modifying OpenClaw's source code. Now with Darwin-style skill evolution (Track 1).
 
-> **Current Version**: Phase 3 (Darwin-style prompt optimization + quality scoring)
+> **Current Version**: Phase 3 (Track 0 + Track 1 Darwin Evolution)
 > **Evaluation Accuracy**: 88.9/100 (v3 prompt, 16/18 correct on labeled test set)
+> **Evolution Engine**: 8-dimension scoring + hill-climbing ratchet
 > **Full project doc**: [OpenClaw Skill Learner — 项目文档 & 实现全记录](https://www.feishu.cn/wiki/OqW8wQhj6iJbZnkbMxWcNzLgnlb)
 
 ---
@@ -15,47 +16,52 @@ An OpenClaw plugin that brings Hermes-style self-evolution to the OpenClaw ecosy
 ```
 Your conversations with Jarvis
   │
-  ├── after_tool_call hook → counts tools, detects SKILL.md reads
-  ├── agent_end hook → if ≥5 calls: HTTP POST → localhost:8300/evaluate
+  ├── after_tool_call hook → counts tools, detects SKILL.md reads,
+  │                          tracks errors + friction signals (Track 1)
+  ├── agent_end hook → if ≥8 calls: HTTP POST → localhost:8300/evaluate
+  │                    scans user messages for friction keywords
   └── session_end hook → memory health check + fallback queue write
                                     │
                    ┌────────────────┴────────────────┐
-                   │  Phase 2 (real-time)             │  Phase 1 (fallback)
-                   │  evaluate-server.py              │  launchd 3:30 AM cron
-                   │  localhost:8300                  │  run-skill-learner.sh
-                   └────────────────┬────────────────┘
-                                    │
-                        Gemini 3 Flash API
-                        (structured eval_json + skill_md + quality_score)
-                                    │
-                              Pre-filter (data-driven)
-                              + Deviation Test (v3 prompt)
-                                    │
-                    ┌───────────────┼───────────────┐
-                    │               │               │
-              New Skill?     Update Skill?      NO_SKILL
-              + quality_score   + quality_score
-                    │               │
-          skills/auto-learned/  .update-proposal.md
-          + .eval.json            + .eval.json
-                    │               │
-              Quality gate: ≥40 → notify, <40 → silent store
-                    │               │
-              Feishu Card 2.0 interactive notification
-              (problem → approach → scenarios → quality score)
-                    │
-          [✅ 通过落地] [💬 方案优化讨论] [⏭ 跳过]
+                   │                                 │
+            triggerEvolution?                  Standard eval
+            frictionSkill?                    (Track 0: unchanged)
+                   │                                 │
+            POST /evolve                     Gemini 3 Flash API
+            skill_evolution.py               eval_json + skill_md
+                   │                                 │
+            Darwin 8-dim rubric              Pre-filter + Deviation Test
+            (structure 60 + effect 40)              │
+                   │                    ┌───────────┼───────────┐
+            ┌──────┴──────┐             │           │           │
+         KEEP → git commit    New Skill?    Update?     NO_SKILL
+         DROP → git revert    quality_score quality_score
+                   │              │           │
+            Feishu 🧬 进化卡片    skills/auto-learned/  .update-proposal.md
+            [✅ 确认] [↩️ 回滚]         │           │
+                                  Quality gate: ≥40 → notify
+                                        │
+                                  Feishu 🧠 Skill 候选卡片
+                                  [✅ 通过落地] [💬 讨论] [⏭ 跳过]
 ```
 
 ---
 
 ## Features
 
-### 🔍 Smart Session Detection
-- **`after_tool_call` hook**: Real-time tool call counting + precise skill usage detection (tracks actual `Read_tool` calls to `SKILL.md` files)
-- **`agent_end` hook**: Fires HTTP POST to localhost:8300 for real-time evaluation when threshold met (≥5 tool calls)
+### 🔍 Smart Session Detection (Track 0)
+- **`after_tool_call` hook**: Real-time tool call counting + precise skill usage detection + error/friction tracking
+- **`agent_end` hook**: Fires HTTP POST to localhost:8300 for real-time evaluation when threshold met (≥8 tool calls). Scans user messages for friction signals (Track 1)
 - **`session_end` hook**: Memory health check, tool stats persistence, fallback queue write
 - **Inbound message ID extraction**: Parses `[msg:om_xxx]` from session headers to enable reply-to-thread notifications
+
+### 🧬 Darwin Skill Evolution (Track 1)
+- **Friction signal detection**: User correction, explicit feedback, repeated tool failures, errors after skill read, manual trigger ("优化 skill X")
+- **8-dimension rubric**: Structure (60pts: frontmatter, workflow, edge cases, checkpoints, specificity, resources) + Effectiveness (40pts: architecture, test performance)
+- **Hill-climbing ratchet**: Diagnose weakest dimension → Gemini generates improvement → re-evaluate → keep if improved, git revert if not
+- **Auto test-prompt generation**: Gemini creates test-prompts.json for skills that don't have one
+- **Feishu evolution report**: 🧬 card with score delta, trigger signals, git diff, confirm/rollback buttons
+- **Git-backed**: All evolution on `auto-evolve/` branches, merged to main on success
 
 ### 🤖 Gemini-Powered Evaluation (Hermes-inspired)
 
@@ -167,7 +173,8 @@ python3 scripts/skill-learner-evaluate.py --dry-run  # preview only
 
 | Constant | Default | Description |
 |----------|---------|-------------|
-| `TOOL_CALL_THRESHOLD` | `5` | Minimum tool calls to mark for analysis |
+| `TOOL_CALL_THRESHOLD` | `8` | Minimum tool calls to mark for analysis |
+| `FRICTION_THRESHOLD` | `4` | Friction weight to trigger evolution |
 | `EVALUATE_SERVER_URL` | `http://127.0.0.1:8300/evaluate` | Real-time eval server endpoint |
 | `MEMORY_LINE_WARN` | `250` | MEMORY.md line warning threshold |
 | `MEMORY_LINE_DANGER` | `300` | MEMORY.md line danger threshold |
@@ -197,10 +204,16 @@ plugin/
 └── openclaw.plugin.json
 
 scripts/
+├── gemini_client.py                  # Shared Gemini API client (DRY extraction)
 ├── skill-learner-evaluate.py         # Batch evaluator (Gemini API + quality scoring)
-├── evaluate-server.py                # Real-time eval microservice (localhost:8300)
+├── skill_evolution.py                # Track 1: Darwin evolution engine (8-dim + ratchet)
+├── evaluate-server.py                # Real-time eval + evolution microservice (:8300)
+├── skill_action.py                   # Card callback handler (approve/skip/discuss/revert/profile_*)
+├── user_modeling.py                  # Track 2: User modeling analyzer (diary + corrections → proposals)
 ├── eval-benchmark.py                 # Darwin benchmark: 6-dimension scoring framework
-├── darwin-optimize.py                # Hill-climbing optimizer (ratchet mechanism)
+├── darwin-optimize.py                # Hill-climbing optimizer for eval prompts
+├── init-workspace-git.sh             # Idempotent workspace git initialization
+├── config.py                         # Shared configuration (paths, constants)
 ├── run-skill-learner.sh              # Wrapper for cron/launchd
 ├── state-arc-analyzer.py             # User state arc analysis (Phase 2D)
 ├── prompts/                          # Pluggable prompt versions
@@ -212,10 +225,13 @@ scripts/
 │   ├── should-reject/                #   Ground truth = NO (6 cases)
 │   └── should-update/                #   Ground truth = UPDATE (4 cases)
 └── darwin-results/                   # Optimization history + cached API results
-    └── results.tsv                   #   Score tracking (darwin-skill compatible)
+    ├── results.tsv                   #   Prompt optimization tracking
+    └── evolution-results.tsv         #   Skill evolution tracking
 
 ai.openclaw.skill-learner.plist       # launchd: batch evaluator (3:30 AM)
 ai.openclaw.skill-learner-server.plist # launchd: real-time server (persistent)
+ai.openclaw.skill-evolution-cron.plist # launchd: batch evolution (4:30 AM)
+ai.openclaw.user-modeling-cron.plist  # launchd: weekly user modeling (Mon 5:00 AM)
 ```
 
 ### Runtime Data (auto-created)
@@ -228,15 +244,16 @@ ai.openclaw.skill-learner-server.plist # launchd: real-time server (persistent)
 │   ├── memory-health.json      # Latest memory health check
 │   ├── server.log              # evaluate-server log
 │   └── evaluate.log            # Batch evaluator log
-└── skills/
-    ├── auto-learned/           # Generated skill drafts
+└── skills/                     # Git-tracked (darwin ratchet)
+    ├── auto-learned/           # Generated skill drafts (git-ignored)
     │   ├── {skill-name}/
     │   │   ├── SKILL.md        # Skill draft
     │   │   ├── .meta.json      # Creation metadata
     │   │   └── .eval.json      # Structured Gemini evaluation (for card display)
     │   └── .pending-review.json
-    └── {existing-skill}/
-        ├── SKILL.md
+    └── {existing-skill}/       # Approved skills (git-tracked)
+        ├── SKILL.md            # Evolved by Track 1
+        ├── test-prompts.json   # Auto-generated test prompts for evolution
         ├── .update-proposal.md # Update patch (if session found improvements)
         └── .eval.json          # Structured update evaluation
 ```
@@ -319,15 +336,88 @@ python3 scripts/eval-benchmark.py --dry-run
 
 ---
 
+## Skill Evolution (Track 1)
+
+Evolve approved skills using Darwin-style 8-dimension scoring:
+
+```bash
+# List eligible skills
+python3 scripts/skill_evolution.py --list
+
+# Dry-run evolution on a specific skill
+python3 scripts/skill_evolution.py --skill messaging-patterns --dry-run
+
+# Live evolution (commits to workspace git)
+python3 scripts/skill_evolution.py --skill messaging-patterns
+
+# Batch: scan friction log and evolve eligible skills
+python3 scripts/skill_evolution.py --batch
+```
+
+**8-Dimension Scoring** (total 100):
+
+| Category | Dimension | Weight | Description |
+|----------|-----------|--------|-------------|
+| Structure | frontmatter | 8 | Name, description, triggers |
+| Structure | workflow_clarity | 15 | Numbered steps, I/O per step |
+| Structure | edge_case_coverage | 10 | Error handling, fallbacks |
+| Structure | checkpoint_design | 7 | User confirmation gates |
+| Structure | instruction_specificity | 15 | Concrete params/examples |
+| Structure | resource_integration | 5 | Linked references |
+| Effect | architecture | 15 | Hierarchy, consistency |
+| Effect | test_performance | 25 | Test-prompt execution quality |
+
+**Friction signals** that trigger evolution:
+
+| Signal | Weight | Detection |
+|--------|--------|-----------|
+| User correction ("不对/错了/wrong") | 3 | agent_end user message scan |
+| Explicit feedback ("skill 有问题") | 3 | agent_end keyword match |
+| Repeated tool failure (≥2x) | 2 | after_tool_call error counter |
+| Error after skill read (within 5 calls) | 2 | after_tool_call correlation |
+| Manual trigger ("优化 skill X") | forced | agent_end regex |
+
+---
+
+## User Modeling (Track 2)
+
+Automatically detect USER.md / SOUL.md / AGENTS.md updates from diary entries and conversation corrections. **Never auto-commits** — generates proposals for human review.
+
+```bash
+# Run analysis (scans last 7 days of diaries + correction signals)
+python3 scripts/user_modeling.py --analyze
+
+# Preview without Gemini calls
+python3 scripts/user_modeling.py --analyze --dry-run
+
+# Custom lookback window
+python3 scripts/user_modeling.py --analyze --days 14
+
+# View pending proposals
+python3 scripts/user_modeling.py --status
+
+# Apply or reject a proposal
+python3 scripts/user_modeling.py --apply <proposal-id>
+python3 scripts/user_modeling.py --reject <proposal-id>
+```
+
+**Signal sources**: diary entries (`memory/YYYY-MM-DD.md`) + conversation correction signals (user says "不对/错了")
+
+**Safety**: proposals only, no auto-commit. Applied changes write to spec files but Lucien decides whether to commit.
+
+---
+
 ## Roadmap
 
-- [ ] **Card action handler**: Implement `card_action` plugin hook to handle button clicks (approve/discuss/skip) directly without text reply
+- [x] ~~**Track 2: User modeling** — auto-propose USER.md/SOUL.md updates from diary + conversation attribution~~ (done: Phase 3)
+- [ ] **Card action handler**: Implement `card_action` plugin hook for button clicks
 - [ ] **SCAN layer**: Embed security scan into eval pipeline
-- [ ] **User modeling**: Detect preference signals in `session_end` hook, auto-propose USER.md updates
 - [ ] **Fallback model**: Automatic Gemini model fallback on rate limits
-- [x] ~~**Darwin optimization**: Prompt hill-climbing with labeled test set~~ (done: v3, 88.9/100)
+- [x] ~~**Track 1: Darwin evolution**: 8-dim scoring + hill-climbing ratchet for SKILL.md~~ (done: Phase 3)
+- [x] ~~**Darwin prompt optimization**: Hill-climbing with labeled test set~~ (done: v3, 88.9/100)
 - [x] ~~**Quality scoring**: 0-100 score driving notification strategy~~ (done: quality_score in eval_json)
 - [x] ~~**Data-driven pre-filter**: Replace keyword heuristic with feature analysis~~ (done: 0% false negative)
+- [x] ~~**Workspace git initialization**: Git-track skills/ for ratchet mechanism~~ (done: 21 SKILL.md tracked)
 
 ---
 

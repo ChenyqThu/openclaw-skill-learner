@@ -2,3 +2,8 @@ node_modules/
 .DS_Store
 *.log
 data/
+__pycache__/
+.omc/
+scripts/darwin-results/cache/
+scripts/darwin-results/*.json
+scripts/prompts/__pycache__/

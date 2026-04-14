@@ -1,12 +1,17 @@
 /**
- * jarvis-skill-learner — OpenClaw Plugin  (Phase 2)
+ * jarvis-skill-learner — OpenClaw Plugin  (Phase 3: Self-Evolution)
  *
- * Phase 2 upgrades:
+ * Track 0 (Skill Learning):
  *  • Idempotency dedup Sets for after_tool_call / agent_end / session_end
- *  • agent_end now extracts transcript from event.messages and fires HTTP
- *    POST to localhost:8300/evaluate (fire-and-forget)
+ *  • agent_end extracts transcript + fires HTTP POST to localhost:8300/evaluate
  *  • Silent fallback to queue file when evaluate-server is unreachable
- *  • session_end slimmed down to: memory health + tool stats + fallback queue
+ *
+ * Track 1 (Skill Evolution — Phase 3):
+ *  • Friction signal detection in after_tool_call and agent_end hooks
+ *  • Signals: user correction, explicit feedback, repeated failure,
+ *    error after skill read, manual trigger ("优化 skill X")
+ *  • Friction data piggybacks on existing HTTP POST (no new network calls)
+ *  • frictionWeight >= 4 triggers Darwin evolution loop server-side
  *
  * Security: No child_process. HTTP to localhost only. fs allowed.
  * Plugin must remain ESM (import / export default definePluginEntry).
@@ -31,6 +36,17 @@ const MEMORY_LINE_DANGER = 300;
 // Dedup Set hard cap
 const DEDUP_MAX = 200;
 
+// Friction detection thresholds
+const FRICTION_THRESHOLD = 4;        // frictionWeight >= 4 triggers evolution
+const FRICTION_ERROR_WINDOW = 5;     // tool calls after skill read to watch for errors
+const FRICTION_REPEAT_FAIL = 2;      // repeated failures of same tool to count as friction
+
+// ─── Friction Detection Patterns ────────────────────────────────────────────
+const FRICTION_CORRECTION_PATTERNS = /不对|不是这样|应该|错了|wrong|redo|重做|有问题|搞错|不行/;
+const FRICTION_FEEDBACK_PATTERNS = /skill\s*有问题|技能有问题|skill.*不好用|skill.*不对/i;
+const FRICTION_OPTIMIZE_PATTERN = /(?:优化|改进|提升)\s*(?:skill|技能)?\s*[「"']?(\S+?)[」"']?\s*$/i;
+const FRICTION_OPTIMIZE_EN = /optimize\s+skill\s+["']?(\S+?)["']?\s*$/i;
+
 // ─── Idempotency Sets ─────────────────────────────────────────────────────────
 const processedToolCalls = new Set();  // key: `${runId}:${toolCallIndex}`
 const processedAgentEnds = new Set();  // key: runId
@@ -48,6 +64,7 @@ function dedupAdd(set, key) {
 // ─── Per-run state ───────────────────────────────────────────────────────────
 const runStats = new Map();
 const runSkillsUsed = new Map(); // runId → Set<skillName>
+const runFriction = new Map();   // runId → { signals: [], totalWeight: 0, targetSkill: null }
 
 // Track which runs agent_end already fired HTTP for (so session_end can skip)
 const agentEndFiredHttp = new Set(); // runId
@@ -59,9 +76,31 @@ let dailyStatsDate = new Date().toISOString().split("T")[0];
 function getOrCreateRun(runId) {
   if (!runId) runId = "__default__";
   if (!runStats.has(runId)) {
-    runStats.set(runId, { toolCalls: [], toolCallIndex: 0, markedForAnalysis: false });
+    runStats.set(runId, {
+      toolCalls: [], toolCallIndex: 0, markedForAnalysis: false,
+      errorsByTool: {},          // toolName → consecutive error count
+      lastSkillReadIndex: -1,    // index of last SKILL.md read
+      lastSkillReadName: null,   // name of last skill read
+    });
   }
   return runStats.get(runId);
+}
+
+function getOrCreateFriction(runId) {
+  if (!runId) runId = "__default__";
+  if (!runFriction.has(runId)) {
+    runFriction.set(runId, { signals: [], totalWeight: 0, targetSkill: null });
+  }
+  return runFriction.get(runId);
+}
+
+function addFrictionSignal(runId, type, weight, evidence, skillName) {
+  const friction = getOrCreateFriction(runId);
+  friction.signals.push({ type, weight, evidence: (evidence || "").slice(0, 200) });
+  friction.totalWeight += weight;
+  if (skillName && !friction.targetSkill) {
+    friction.targetSkill = skillName;
+  }
 }
 
 // ─── Tool Usage Stats ─────────────────────────────────────────────────────────
@@ -312,7 +351,7 @@ export default definePluginEntry({
   description: "Auto-detect reusable patterns from complex sessions and create skill drafts",
 
   register: (api) => {
-    console.log("[skill-learner] 🧠 Plugin registered (Phase 2). Hooks: after_tool_call, agent_end, session_end");
+    console.log("[skill-learner] 🧠 Plugin registered (Phase 3: Self-Evolution). Hooks: after_tool_call, agent_end, session_end");
 
     // ── Hook 1: after_tool_call ───────────────────────────────────────────────
     api.on("after_tool_call", (event, ctx) => {
@@ -332,6 +371,29 @@ export default definePluginEntry({
       });
       recordToolUsage(event.toolName, event.durationMs, event.error);
 
+      // ── Friction: track errors per tool ────────────────────────────────────
+      if (event.error) {
+        const toolName = event.toolName;
+        run.errorsByTool[toolName] = (run.errorsByTool[toolName] || 0) + 1;
+
+        // Signal: repeated failure of same tool (>= FRICTION_REPEAT_FAIL)
+        if (run.errorsByTool[toolName] >= FRICTION_REPEAT_FAIL) {
+          addFrictionSignal(runId, "repeated_failure", 2,
+            `${toolName} failed ${run.errorsByTool[toolName]}x consecutively`,
+            run.lastSkillReadName);
+        }
+
+        // Signal: error within FRICTION_ERROR_WINDOW calls after skill read
+        if (run.lastSkillReadIndex >= 0 && (tcIndex - run.lastSkillReadIndex) <= FRICTION_ERROR_WINDOW) {
+          addFrictionSignal(runId, "error_after_skill_read", 2,
+            `${toolName} error ${tcIndex - run.lastSkillReadIndex} calls after reading ${run.lastSkillReadName}`,
+            run.lastSkillReadName);
+        }
+      } else {
+        // Reset consecutive error count on success
+        run.errorsByTool[event.toolName] = 0;
+      }
+
       // Detect skill loading via Read_tool on SKILL.md
       if (event.toolName === "Read_tool" || event.toolName === "read") {
         const filePath = event.params?.path || "";
@@ -340,6 +402,9 @@ export default definePluginEntry({
           const skillName = skillMatch[1];
           if (!runSkillsUsed.has(runId)) runSkillsUsed.set(runId, new Set());
           runSkillsUsed.get(runId).add(skillName);
+          // Track for friction correlation
+          run.lastSkillReadIndex = tcIndex;
+          run.lastSkillReadName = skillName;
           console.log(`[skill-learner] 📖 Skill loaded: ${skillName}`);
         }
       }
@@ -364,6 +429,7 @@ export default definePluginEntry({
           for (const k of keys.slice(0, keys.length - 10)) {
             runStats.delete(k);
             runSkillsUsed.delete(k);
+            runFriction.delete(k);
             agentEndFiredHttp.delete(k);
           }
         }
@@ -387,6 +453,43 @@ export default definePluginEntry({
         summary = extractFromMessages(event.messages);
       }
 
+      // ── Friction + Correction signals ────────────────────────────────────────
+      const friction = getOrCreateFriction(runId);
+      const userMsgs = summary?.userMessages || [];
+      const correctionSignals = []; // Track 2: user modeling
+      for (const msg of userMsgs) {
+        // Manual trigger: "优化 skill X" / "optimize skill X"
+        const manualMatch = msg.match(FRICTION_OPTIMIZE_PATTERN) || msg.match(FRICTION_OPTIMIZE_EN);
+        if (manualMatch) {
+          const targetName = manualMatch[1];
+          friction.targetSkill = targetName;
+          friction.totalWeight = 999; // forced trigger
+          addFrictionSignal(runId, "manual_trigger", 999, `用户要求优化: ${targetName}`, targetName);
+          break;
+        }
+        // User correction: "不对/错了/wrong/redo"
+        if (FRICTION_CORRECTION_PATTERNS.test(msg)) {
+          addFrictionSignal(runId, "user_correction", 3,
+            msg.slice(0, 100),
+            friction.targetSkill || (usedSkills.length === 1 ? usedSkills[0] : null));
+          // Track 2: capture correction context for user modeling
+          correctionSignals.push({ type: "user_correction", text: msg.slice(0, 300) });
+        }
+        // Explicit feedback: "这个 skill 有问题"
+        if (FRICTION_FEEDBACK_PATTERNS.test(msg)) {
+          addFrictionSignal(runId, "explicit_feedback", 3,
+            msg.slice(0, 100),
+            friction.targetSkill || (usedSkills.length === 1 ? usedSkills[0] : null));
+          correctionSignals.push({ type: "explicit_feedback", text: msg.slice(0, 300) });
+        }
+      }
+
+      // Determine if evolution should be triggered
+      const triggerEvolution = friction.totalWeight >= FRICTION_THRESHOLD && !!friction.targetSkill;
+      if (triggerEvolution) {
+        console.log(`[skill-learner] 🧬 Friction detected (weight=${friction.totalWeight}) → evolution trigger for: ${friction.targetSkill}`);
+      }
+
       // Build payload
       const payload = {
         runId: runId,
@@ -400,6 +503,13 @@ export default definePluginEntry({
         assistantTexts: summary?.assistantTexts || [],
         lastInboundMessageId: summary?.lastInboundMessageId || null,
         timestamp: new Date().toISOString(),
+        // Track 1: friction signals for skill evolution
+        frictionSignals: friction.signals,
+        frictionWeight: friction.totalWeight,
+        frictionSkill: friction.targetSkill,
+        triggerEvolution,
+        // Track 2: correction signals for user modeling
+        correctionSignals,
       };
 
       // Mark so session_end skips re-queuing

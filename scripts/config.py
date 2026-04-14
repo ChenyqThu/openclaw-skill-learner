@@ -30,3 +30,13 @@ QUEUE_DIR = DATA_DIR / "analysis-queue"
 SKILLS_DIR = WORKSPACE / "skills/auto-learned"
 ALL_SKILLS_DIR = WORKSPACE / "skills"
 MEMORY_MD = WORKSPACE / "MEMORY.md"
+
+# ─── Evolution (Track 1: Darwin) ────────────────────────────────────────────
+EVOLUTION_LOG = DATA_DIR / "evolution.log"
+FRICTION_LOG = DATA_DIR / "friction-signals.json"
+EVOLUTION_TSV = Path(__file__).parent / "darwin-results" / "evolution-results.tsv"
+
+# ─── User Modeling (Track 2: Gap 7) ─────────────────────────────────────────
+CORRECTION_LOG = DATA_DIR / "correction-signals.json"
+PENDING_UPDATES = DATA_DIR / "pending-user-updates.json"
+USER_MODELING_LOG = DATA_DIR / "user-modeling.log"

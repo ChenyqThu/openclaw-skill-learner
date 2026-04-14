@@ -2,10 +2,15 @@
 
 ## Overview
 
-OpenClaw Skill Learner is a two-layer system:
+OpenClaw Skill Learner is a two-layer, three-track self-evolution system:
 
-1. **Plugin layer** (`plugin/index.js`): Runs inside OpenClaw, zero network calls, collects session data via hooks
-2. **Evaluator layer** (`scripts/`): Runs externally, calls Gemini API, sends Feishu notifications
+1. **Plugin layer** (`plugin/index.js`): Runs inside OpenClaw, zero network calls, collects session data + friction signals via hooks
+2. **Evaluator layer** (`scripts/`): Runs externally, calls Gemini API, sends Feishu notifications, runs evolution loops
+
+**Three Tracks**:
+- **Track 0 (Skill Learning)**: Conversation → detect reusable patterns → generate candidates → human approval
+- **Track 1 (Darwin Evolution)**: Friction detection → 8-dim scoring → hill-climbing → git ratchet → auto-commit/revert
+- **Track 2 (User Modeling)**: Diary + conversation attribution → USER.md/SOUL.md proposals → human confirmation (planned)
 
 This separation is required by OpenClaw's security scanner, which blocks network calls from plugins.
 
@@ -20,12 +25,16 @@ This separation is required by OpenClaw's security scanner, which blocks network
 │  after_tool_call hook                                │
 │    → increment per-run tool counter                  │
 │    → detect SKILL.md reads (Read_tool)               │
+│    → track errors per tool (friction signal)         │
+│    → detect error after skill read (friction)        │
 │    → accumulate daily tool stats                     │
 │                                                      │
 │  agent_end hook                                      │
-│    → if toolCount >= 5:                              │
+│    → if toolCount >= 8:                              │
 │        extract transcript summary from event.messages│
+│        scan userMessages for friction keywords       │
 │        HTTP POST → localhost:8300/evaluate           │
+│        (payload includes frictionSignals/Weight/Skill│
 │        (fallback: write to analysis-queue/ on disk)  │
 │                                                      │
 │  session_end hook                                    │
@@ -40,11 +49,19 @@ This separation is required by OpenClaw's security scanner, which blocks network
 │                                                      │
 │  Rate limit: 5 Gemini calls/min                      │
 │  Concurrency: one evaluation at a time (Lock)        │
+│  Evolution: separate lock, 2/hour rate limit         │
 │                                                      │
+│  Track 0 path:                                       │
 │  1. Write queue file (for audit trail)               │
 │  2. Import & call process_queue()                    │
 │  3. Detect new .eval.json files                      │
-│  4. Send Feishu Card 2.0 notification                │
+│  4. Send Feishu Card 2.0 notification (🧠 Skill 候选)│
+│                                                      │
+│  Track 1 path (if triggerEvolution=true):            │
+│  1. Log friction signals                             │
+│  2. Import skill_evolution.py                        │
+│  3. Run SkillEvolver.evolve() in background thread   │
+│  4. Send Feishu evolution report (🧬 Skill 进化)     │
 └──────────────────┬──────────────────────────────────┘
                    │ imports
                    ▼
@@ -201,10 +218,33 @@ The `eval_json` block populates the notification card and includes `quality_scor
 
 ## Phase History
 
+### Track 1: Darwin Evolution (Phase 3)
+
+**Why hook-triggered, not scheduled?**
+Friction signals are most valuable in real-time — the user's correction happens during a specific conversation. Waiting for a cron job loses the context. The plugin detects friction and piggybacks it on the existing HTTP POST (no new network calls).
+
+**Why 8-dimension scoring (not 6)?**
+The prompt optimizer uses 6 dimensions focused on classification accuracy. Skill evolution needs different dimensions focused on SKILL.md quality — frontmatter, workflow clarity, edge cases, checkpoints, specificity, resources, architecture, and test performance.
+
+**Why git branches for evolution?**
+Each evolution runs on `auto-evolve/{skill}-{timestamp}` branch. If all rounds improve, the branch merges to main. If any round regresses, `git revert HEAD --no-edit` (safe revert, not reset). This ensures the ratchet: scores only go up.
+
+**Why separate evolution lock?**
+Evolution is expensive (multiple Gemini calls per round). The evolution lock is separate from the evaluation lock so Track 0 can continue while Track 1 runs. Rate limit: 2 evolutions/hour.
+
+**Safety: SKILL.md only, never core files**
+`SkillEvolver` has a hardcoded blocklist rejecting SOUL.md/AGENTS.md/USER.md. Only approved skills (not `auto-learned/`) are eligible. This is enforced at the engine level, not just by convention.
+
+---
+
+## Phase History
+
 | Phase | Date | Key change |
 |-------|------|------------|
 | 1 (Batch) | 2026-04-10 | Plugin hooks + launchd 3:30 AM batch evaluation |
 | 2 (Real-time) | 2026-04-12 | evaluate-server microservice + localhost HTTP trigger |
 | 2D (State arc) | 2026-04-12 | state-arc-analyzer.py + user modeling signals |
 | Card redesign | 2026-04-12 | Feishu Card 2.0 + Gemini prompt upgrade |
-| 3 (Darwin) | 2026-04-13 | Darwin-style prompt optimization (66.6→88.9), quality scoring, pluggable prompts, data-driven pre-filter |
+| 3 (Darwin prompts) | 2026-04-13 | Darwin-style prompt optimization (66.6→88.9), quality scoring, pluggable prompts, data-driven pre-filter |
+| 3 (Track 1) | 2026-04-14 | Darwin skill evolution engine, friction detection, 8-dim rubric, git ratchet, workspace git init, gemini_client extraction, Feishu evolution report card |
+| 3 (Track 2) | 2026-04-14 | User modeling analyzer, diary + correction signal attribution, Gemini-powered spec file proposals, profile_approve/reject actions, weekly cron |

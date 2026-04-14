@@ -26,18 +26,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-# Load env vars
-def _load_env():
-    env_file = Path.home() / ".openclaw/.env"
-    if env_file.exists():
-        for line in env_file.read_text().splitlines():
-            line = line.strip()
-            if line and not line.startswith("#") and "=" in line:
-                if line.startswith("export "):
-                    line = line[7:]
-                key, _, val = line.partition("=")
-                val = val.strip().strip('"').strip("'")
-                os.environ.setdefault(key.strip(), val)
+from gemini_client import load_env as _load_env
 
 _load_env()
 
@@ -107,26 +96,8 @@ DIMENSION_STRATEGIES = {
 # ─── Gemini Meta-Optimizer ───────────────────────────────────────────────────
 def call_gemini_meta(prompt: str) -> str | None:
     """Call Gemini for meta-optimization (improving the prompt itself)."""
-    import urllib.request
-    api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("NANO_BANANA_API_KEY")
-    if not api_key:
-        print("ERROR: No GEMINI_API_KEY found")
-        return None
-
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={api_key}"
-    payload = json.dumps({
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.3, "maxOutputTokens": 8192},
-    }).encode()
-
-    req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
-    try:
-        with urllib.request.urlopen(req, timeout=90) as resp:
-            data = json.loads(resp.read())
-            return data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text")
-    except Exception as e:
-        print(f"ERROR: Gemini meta-call failed: {e}")
-        return None
+    from gemini_client import call_gemini
+    return call_gemini(prompt, model=GEMINI_MODEL, temperature=0.3, max_tokens=8192)
 
 
 # ─── Benchmark Runner ────────────────────────────────────────────────────────

@@ -19,11 +19,12 @@ import sys
 from pathlib import Path
 from datetime import datetime, timedelta
 
+from gemini_client import load_env, call_gemini, extract_eval_json, extract_skill_md
+
 QUEUE_DIR = Path.home() / ".openclaw/workspace/data/skill-learner/analysis-queue"
 SKILLS_DIR = Path.home() / ".openclaw/workspace/skills/auto-learned"
 ALL_SKILLS_DIR = Path.home() / ".openclaw/workspace/skills"
 PENDING_REVIEW = SKILLS_DIR / ".pending-review.json"
-GEMINI_MODEL = "gemini-3-flash-preview"  # upgraded from 3.1-flash-lite for better judgment accuracy
 
 DRY_RUN = "--dry-run" in sys.argv
 
@@ -82,27 +83,12 @@ def should_skip_session(request: dict) -> str | None:
 
 def _extract_eval_json(result: str) -> dict:
     """Extract the ```eval_json block from Gemini output and parse it."""
-    m = re.search(r'```eval_json\s*\n(.*?)\n```', result, re.DOTALL)
-    if not m:
-        return {}
-    try:
-        return json.loads(m.group(1))
-    except Exception:
-        return {}
+    return extract_eval_json(result)
 
 
 def _extract_skill_md(result: str) -> str:
     """Extract the ```skill_md block, falling back to the full result."""
-    m = re.search(r'```skill_md\s*\n(.*?)\n```', result, re.DOTALL)
-    if m:
-        return m.group(1).strip()
-    # Legacy fallback: strip outer fences if present
-    content = result.strip()
-    if content.startswith("```"):
-        content = content.split("\n", 1)[1] if "\n" in content else content
-    if content.endswith("```"):
-        content = content.rsplit("\n", 1)[0]
-    return content
+    return extract_skill_md(result)
 
 
 def _extract_name_from_result(result: str) -> str | None:
@@ -113,27 +99,8 @@ def _extract_name_from_result(result: str) -> str | None:
     return None
 
 
-def call_gemini(prompt: str) -> str | None:
-    import urllib.request
-    api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("NANO_BANANA_API_KEY")
-    if not api_key:
-        print("ERROR: No GEMINI_API_KEY found")
-        return None
 
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={api_key}"
-    payload = json.dumps({
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.2, "maxOutputTokens": 4096},
-    }).encode()
-
-    req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
-    try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            data = json.loads(resp.read())
-            return data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text")
-    except Exception as e:
-        print(f"ERROR: Gemini API failed: {e}")
-        return None
+# call_gemini is now imported from gemini_client
 
 
 # ─── Existing Skill Scanner ──────────────────────────────────────────────────

@@ -21,25 +21,15 @@ import importlib.util
 from pathlib import Path
 from datetime import datetime
 
+from gemini_client import load_env as _load_env
+from gemini_client import call_gemini, extract_eval_json, extract_skill_md
+
 # ─── Paths ───────────────────────────────────────────────────────────────────
 SCRIPT_DIR = Path(__file__).parent
 TEST_CASES_DIR = SCRIPT_DIR / "test-cases"
 RESULTS_DIR = SCRIPT_DIR / "darwin-results"
 CACHE_DIR = SCRIPT_DIR / "darwin-results" / "cache"
 ALL_SKILLS_DIR = Path.home() / ".openclaw/workspace/skills"
-
-# ─── Load env vars from ~/.openclaw/.env ─────────────────────────────────────
-def _load_env():
-    env_file = Path.home() / ".openclaw/.env"
-    if env_file.exists():
-        for line in env_file.read_text().splitlines():
-            line = line.strip()
-            if line and not line.startswith("#") and "=" in line:
-                if line.startswith("export "):
-                    line = line[7:]
-                key, _, val = line.partition("=")
-                val = val.strip().strip('"').strip("'")
-                os.environ.setdefault(key.strip(), val)
 
 _load_env()
 
@@ -66,44 +56,8 @@ def load_prompt_module(version: str):
     return mod
 
 
-# ─── Gemini Caller ───────────────────────────────────────────────────────────
-def call_gemini(prompt: str, model: str = "gemini-3-flash-preview") -> str | None:
-    import urllib.request
-    api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("NANO_BANANA_API_KEY")
-    if not api_key:
-        print("ERROR: No GEMINI_API_KEY found")
-        return None
 
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
-    payload = json.dumps({
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.2, "maxOutputTokens": 4096},
-    }).encode()
-
-    req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
-    try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            data = json.loads(resp.read())
-            return data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text")
-    except Exception as e:
-        print(f"ERROR: Gemini API failed: {e}")
-        return None
-
-
-# ─── Result Parsers (same as skill-learner-evaluate.py) ─────────────────────
-def extract_eval_json(result: str) -> dict:
-    m = re.search(r'```eval_json\s*\n(.*?)\n```', result, re.DOTALL)
-    if not m:
-        return {}
-    try:
-        return json.loads(m.group(1))
-    except Exception:
-        return {}
-
-
-def extract_skill_md(result: str) -> str:
-    m = re.search(r'```skill_md\s*\n(.*?)\n```', result, re.DOTALL)
-    return m.group(1).strip() if m else ""
+# call_gemini, extract_eval_json, extract_skill_md imported from gemini_client
 
 
 def classify_result(result: str) -> str:

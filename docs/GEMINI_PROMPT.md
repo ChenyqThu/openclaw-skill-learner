@@ -202,6 +202,21 @@ python3 scripts/darwin-optimize.py --max-rounds 5    # auto-optimize
 
 Flash-lite was cheaper but judgment quality was insufficient for the Skill boundary discrimination task. Flash provides significantly better NO_SKILL / qualify discrimination.
 
+All Gemini calls now go through the shared `gemini_client.py` module (extracted in Phase 3 to eliminate duplication across 4 scripts).
+
+---
+
+## Track 1: Evolution Scoring (separate from evaluation)
+
+Track 1 uses a different 8-dimension rubric for scoring SKILL.md quality (not session classification). See `skill_evolution.py` for details.
+
+| Category | Dimension | Weight |
+|----------|-----------|--------|
+| Structure (60) | frontmatter, workflow_clarity, edge_case_coverage, checkpoint_design, instruction_specificity, resource_integration | 8+15+10+7+15+5 |
+| Effectiveness (40) | architecture, test_performance | 15+25 |
+
+The evolution prompt asks Gemini to score each dimension 1-10, then a meta-prompt targets the weakest dimension for improvement. This is distinct from the evaluation prompt optimization (which uses 6 classification-focused dimensions).
+
 ---
 
 ## Dedup via Existing Skills Injection

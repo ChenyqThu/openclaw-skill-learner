@@ -58,13 +58,19 @@ log = logging.getLogger("evaluate-server")
 # ─── Constants ────────────────────────────────────────────────────────────────
 MAX_BODY_SIZE = 1 * 1024 * 1024  # 1 MB
 RATE_LIMIT_PER_MIN = 5
+EVOLUTION_RATE_LIMIT_PER_HOUR = 2
 
 # ─── State ────────────────────────────────────────────────────────────────────
 start_time = time.time()
 evaluated_count = 0
+evolution_count = 0
 
 # Concurrency: one evaluation at a time
 eval_lock = threading.Lock()
+
+# Evolution: separate lock, one evolution at a time
+evolution_lock = threading.Lock()
+evolution_call_times = []  # timestamps of recent evolution triggers
 
 # Rate limiting: max 5 Gemini calls per minute
 rate_lock = threading.Lock()
@@ -453,6 +459,21 @@ def handle_evaluate(body: dict) -> dict:
         except Exception as e:
             log.warning(f"Could not check pending review for notifications: {e}")
 
+        # ── Track 1: Check if evolution should be triggered ──────────────────
+        if body.get("triggerEvolution") and body.get("frictionSkill"):
+            friction_skill = body["frictionSkill"]
+            friction_signals = body.get("frictionSignals", [])
+            log.info(f"Friction detected for skill: {friction_skill} (weight={body.get('frictionWeight', 0)})")
+            # Trigger evolution in background
+            t = threading.Thread(
+                target=trigger_evolution,
+                args=(friction_skill, friction_signals, body),
+                daemon=True,
+            )
+            t.start()
+            with _notification_lock:
+                _notification_threads.append(t)
+
         log.info(f"Evaluation complete for request {request_id}")
         return {"status": "ok", "requestId": request_id, "evaluated": evaluated_count}
 
@@ -461,6 +482,303 @@ def handle_evaluate(body: dict) -> dict:
         return {"status": "error", "requestId": request_id, "message": str(e)}
     finally:
         eval_lock.release()
+
+# ─── Evolution Trigger ────────────────────────────────────────────────────────
+
+def check_evolution_rate_limit() -> bool:
+    """Return True if we can trigger evolution (under hourly limit)."""
+    now = time.time()
+    global evolution_call_times
+    evolution_call_times = [t for t in evolution_call_times if now - t < 3600]
+    if len(evolution_call_times) >= EVOLUTION_RATE_LIMIT_PER_HOUR:
+        return False
+    evolution_call_times.append(now)
+    return True
+
+
+def trigger_evolution(skill_name: str, friction_signals: list, body: dict):
+    """
+    Run skill evolution in background thread.
+    Imports skill_evolution.py and runs SkillEvolver.
+    """
+    global evolution_count
+
+    if not check_evolution_rate_limit():
+        log.warning(f"Evolution rate limit reached ({EVOLUTION_RATE_LIMIT_PER_HOUR}/hour), skipping: {skill_name}")
+        return
+
+    if not evolution_lock.acquire(blocking=False):
+        log.info(f"Evolution already in progress, skipping: {skill_name}")
+        return
+
+    def run():
+        global evolution_count
+        try:
+            log.info(f"Starting evolution for skill: {skill_name}")
+
+            # Log friction signals
+            friction_log = DATA_DIR / "friction-signals.json"
+            try:
+                existing = json.loads(friction_log.read_text()) if friction_log.exists() else []
+            except Exception:
+                existing = []
+            existing.append({
+                "timestamp": datetime.now().isoformat(),
+                "skillName": skill_name,
+                "frictionSignals": friction_signals,
+                "frictionWeight": body.get("frictionWeight", 0),
+                "runId": body.get("runId"),
+            })
+            # Keep last 200 entries
+            if len(existing) > 200:
+                existing = existing[-200:]
+            friction_log.write_text(json.dumps(existing, indent=2, ensure_ascii=False))
+
+            # Import and run evolution
+            import importlib.util
+            spec = importlib.util.spec_from_file_location(
+                "skill_evolution", str(Path(__file__).parent / "skill_evolution.py"))
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+
+            evolver = mod.SkillEvolver(skill_name)
+            err = evolver.setup()
+            if err:
+                log.error(f"Evolution setup failed: {err}")
+                send_evolution_report(skill_name, None, friction_signals, error=err)
+                return
+
+            result = evolver.evolve()
+            evolution_count += 1
+            log.info(f"Evolution complete: {skill_name} → {result.status} ({result.before_score} → {result.after_score})")
+
+            # Send Feishu notification
+            send_evolution_report(skill_name, result, friction_signals)
+
+        except Exception as e:
+            log.error(f"Evolution error for {skill_name}: {e}", exc_info=True)
+            send_evolution_report(skill_name, None, friction_signals, error=str(e))
+        finally:
+            evolution_lock.release()
+
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    with _notification_lock:
+        _notification_threads.append(t)
+
+
+def send_evolution_report(skill_name: str, result, friction_signals: list, error: str = None):
+    """Send a Feishu card reporting evolution results."""
+    import urllib.request as ureq
+
+    if error:
+        header_color = "red"
+        title = f"🧬 Skill 进化失败 · {skill_name}"
+        score_text = f"❌ 错误：{error}"
+        detail_content = f"**触发信号**：{len(friction_signals)} 个\n**状态**：失败"
+    elif result and result.status == "improved":
+        header_color = "green"
+        delta = result.after_score - result.before_score
+        title = f"🧬 Skill 进化成功 · {skill_name} · +{delta:.1f}"
+        score_text = f"📊 **分数变化**：{result.before_score} → {result.after_score} (+{delta:.1f})"
+        detail_content = (
+            f"**优化维度**：{result.weakest_dim}\n"
+            f"**改动摘要**：{result.change_summary}\n"
+            f"**轮次**：{result.rounds}\n"
+            f"**Commits**：{', '.join(result.commits)}"
+        )
+    elif result and result.status == "reverted":
+        header_color = "orange"
+        title = f"🧬 Skill 进化回退 · {skill_name}"
+        score_text = f"📊 **分数**：{result.before_score}/100（未能提升，已自动回退）"
+        detail_content = (
+            f"**尝试维度**：{result.weakest_dim}\n"
+            f"**轮次**：{result.rounds}\n"
+            f"**结果**：棘轮拒绝回归，已恢复原版本"
+        )
+    else:
+        header_color = "grey"
+        title = f"🧬 Skill 进化无变化 · {skill_name}"
+        score_text = f"📊 **分数**：{result.before_score if result else '?'}/100（未发现可改进维度）"
+        detail_content = "所有维度已达到较高水平，无需优化"
+
+    # Format friction signals
+    signal_lines = []
+    for sig in (friction_signals or [])[:5]:
+        signal_lines.append(f"- {sig.get('type', '?')}: {sig.get('evidence', '')[:80]}")
+    signal_text = "\n".join(signal_lines) if signal_lines else "（无详细信号）"
+
+    body_elements = [
+        {"tag": "markdown", "content": score_text},
+        {"tag": "markdown", "content": f"🔍 **触发信号**\n{signal_text}"},
+    ]
+
+    if result and result.status == "improved":
+        body_elements.append({
+            "tag": "collapsible_panel",
+            "expanded": False,
+            "background_color": "grey-50",
+            "header": {
+                "title": {"tag": "markdown", "content": "📎 **详细维度分数 & Git Diff**"},
+                "background_color": "grey-100",
+            },
+            "border": {"color": "grey-200", "corner_radius": "8px"},
+            "elements": [{"tag": "markdown", "content": detail_content, "text_size": "notation"}],
+        })
+
+        # Buttons: confirm / rollback
+        import base64
+        encoded_name = base64.urlsafe_b64encode(skill_name.encode()).decode().rstrip("=")
+        body_elements.append({
+            "tag": "form",
+            "name": "evolution_action_form",
+            "elements": [
+                {
+                    "tag": "column_set", "flex_mode": "none",
+                    "columns": [
+                        {"tag": "column", "width": "auto", "elements": [{
+                            "tag": "button", "type": "primary",
+                            "name": f"evo_confirm||{encoded_name}",
+                            "form_action_type": "submit",
+                            "text": {"tag": "plain_text", "content": "✅ 确认"},
+                        }]},
+                        {"tag": "column", "width": "auto", "elements": [{
+                            "tag": "button", "type": "danger",
+                            "name": f"evo_revert||{encoded_name}",
+                            "form_action_type": "submit",
+                            "text": {"tag": "plain_text", "content": "↩️ 回滚"},
+                            "confirm": {
+                                "title": {"tag": "plain_text", "content": "确认回滚？"},
+                                "text": {"tag": "plain_text", "content": f"将撤销对「{skill_name}」的进化改动"},
+                            },
+                        }]},
+                    ],
+                },
+            ],
+        })
+    else:
+        body_elements.append({"tag": "markdown", "content": detail_content})
+
+    card = {
+        "schema": "2.0",
+        "config": {"width_mode": "fill"},
+        "header": {
+            "title": {"content": title, "tag": "plain_text"},
+            "template": header_color,
+        },
+        "body": {
+            "direction": "vertical",
+            "vertical_spacing": "8px",
+            "elements": body_elements,
+        },
+    }
+
+    card_json = json.dumps(card)
+    cmd = [
+        "openclaw", "message", "send",
+        "--channel", "feishu",
+        "--target", f"user:{FEISHU_TARGET_OPEN_ID}",
+        "--card", card_json,
+    ]
+    try:
+        result_cmd = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+        if result_cmd.returncode == 0:
+            log.info(f"Evolution report card sent for: {skill_name}")
+        else:
+            log.warning(f"Evolution report send failed: {result_cmd.stderr.strip()}")
+    except Exception as e:
+        log.warning(f"Evolution report exception: {e}")
+
+
+# ─── User Modeling Report Card ────────────────────────────────────────────────
+
+def send_modeling_report(proposals: list):
+    """Send a Feishu card with user modeling proposals (batch display)."""
+    if not proposals:
+        return
+
+    pending = [p for p in proposals if p.get("status") == "pending"]
+    if not pending:
+        return
+
+    header_color = "blue"
+    title = f"👤 画像更新建议 · {len(pending)} 条"
+
+    body_elements = [
+        {"tag": "markdown", "content": f"📊 **分析结果**：发现 {len(pending)} 条需要审核的画像更新建议"},
+    ]
+
+    # Show each proposal
+    for i, p in enumerate(pending[:8], 1):
+        target = p.get("target_file", "?")
+        section = p.get("section", "?")
+        action = "新增" if p.get("action") == "append" else "修改"
+        confidence = p.get("confidence", "?")
+        proposed = p.get("proposed_text", "")[:200]
+        reason = p.get("reason", "")[:150]
+
+        body_elements.append({
+            "tag": "markdown",
+            "content": (
+                f"**[{i}] {target} § {section}** ({action}, {confidence})\n"
+                f"建议：{proposed}\n"
+                f"理由：{reason}"
+            ),
+        })
+
+    # Collapsed low-confidence
+    low_conf = [p for p in proposals if p.get("confidence") == "low"]
+    if low_conf:
+        body_elements.append({
+            "tag": "collapsible_panel",
+            "expanded": False,
+            "background_color": "grey-50",
+            "header": {
+                "title": {"tag": "markdown", "content": f"📎 **低置信度提案 ({len(low_conf)} 条)**"},
+                "background_color": "grey-100",
+            },
+            "border": {"color": "grey-200", "corner_radius": "8px"},
+            "elements": [{"tag": "markdown", "content": "\n".join(
+                f"- {p.get('target_file')} § {p.get('section')}: {p.get('proposed_text', '')[:80]}"
+                for p in low_conf[:10]
+            )}],
+        })
+
+    body_elements.append({
+        "tag": "markdown",
+        "content": "使用命令审核：\n`python3 scripts/user_modeling.py --status`\n`python3 scripts/user_modeling.py --apply <id>`",
+    })
+
+    card = {
+        "schema": "2.0",
+        "config": {"width_mode": "fill"},
+        "header": {
+            "title": {"content": title, "tag": "plain_text"},
+            "template": header_color,
+        },
+        "body": {
+            "direction": "vertical",
+            "vertical_spacing": "8px",
+            "elements": body_elements,
+        },
+    }
+
+    card_json = json.dumps(card)
+    cmd = [
+        "openclaw", "message", "send",
+        "--channel", "feishu",
+        "--target", f"user:{FEISHU_TARGET_OPEN_ID}",
+        "--card", card_json,
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+        if result.returncode == 0:
+            log.info(f"Modeling report card sent ({len(pending)} proposals)")
+        else:
+            log.warning(f"Modeling report send failed: {result.stderr.strip()}")
+    except Exception as e:
+        log.warning(f"Modeling report exception: {e}")
+
 
 # ─── HTTP Request Handler ─────────────────────────────────────────────────────
 class EvaluateHandler(BaseHTTPRequestHandler):
@@ -492,8 +810,69 @@ class EvaluateHandler(BaseHTTPRequestHandler):
             self.send_json(404, {"error": "not found"})
 
     def do_POST(self):
-        if self.path != "/evaluate":
+        if self.path not in ("/evaluate", "/evolve", "/model"):
             self.send_json(404, {"error": "not found"})
+            return
+
+        # Handle /model endpoint (Track 2: user modeling)
+        if self.path == "/model":
+            content_length = int(self.headers.get("Content-Length", 0))
+            if content_length == 0:
+                self.send_json(400, {"error": "empty body"})
+                return
+            try:
+                raw = self.rfile.read(content_length)
+                body = json.loads(raw)
+            except Exception as e:
+                self.send_json(400, {"error": f"invalid JSON: {e}"})
+                return
+
+            log.info(f"POST /model: correctionSignals={len(body.get('correctionSignals', []))}")
+
+            # Log correction signals for weekly analysis
+            correction_log = DATA_DIR / "correction-signals.json"
+            try:
+                existing = json.loads(correction_log.read_text()) if correction_log.exists() else []
+            except Exception:
+                existing = []
+            existing.append({
+                "timestamp": datetime.now().isoformat(),
+                "correctionSignals": body.get("correctionSignals", []),
+                "runId": body.get("runId"),
+                "agentId": body.get("agentId"),
+            })
+            if len(existing) > 500:
+                existing = existing[-500:]
+            correction_log.write_text(json.dumps(existing, indent=2, ensure_ascii=False))
+
+            self.send_json(202, {"status": "logged", "count": len(body.get("correctionSignals", []))})
+            return
+
+        # Handle /evolve endpoint directly
+        if self.path == "/evolve":
+            content_length = int(self.headers.get("Content-Length", 0))
+            if content_length == 0:
+                self.send_json(400, {"error": "empty body"})
+                return
+            try:
+                raw = self.rfile.read(content_length)
+                body = json.loads(raw)
+            except Exception as e:
+                self.send_json(400, {"error": f"invalid JSON: {e}"})
+                return
+
+            skill_name = body.get("skillName")
+            if not skill_name:
+                self.send_json(400, {"error": "skillName required"})
+                return
+
+            log.info(f"POST /evolve: skill={skill_name}")
+            trigger_evolution(
+                skill_name,
+                body.get("frictionSignals", []),
+                body,
+            )
+            self.send_json(202, {"status": "accepted", "skillName": skill_name})
             return
 
         content_length = int(self.headers.get("Content-Length", 0))
