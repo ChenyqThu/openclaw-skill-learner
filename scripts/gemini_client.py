@@ -75,14 +75,12 @@ def extract_eval_json(result: str) -> dict:
 
 
 def extract_skill_md(result: str) -> str:
-    """Extract the ```skill_md``` block, falling back to the full result."""
+    """Extract the ```skill_md``` block. Returns empty string if no valid skill found."""
     m = re.search(r'```skill_md\s*\n(.*?)\n```', result, re.DOTALL)
     if m:
-        return m.group(1).strip()
-    # Legacy fallback: strip outer fences if present
-    content = result.strip()
-    if content.startswith("```"):
-        content = content.split("\n", 1)[1] if "\n" in content else content
-    if content.endswith("```"):
-        content = content.rsplit("\n", 1)[0]
-    return content
+        content = m.group(1).strip()
+        # Validate: real SKILL.md should start with a markdown heading
+        if content.startswith("#"):
+            return content
+    # No valid skill_md block found — do NOT fallback to raw evaluation text
+    return ""

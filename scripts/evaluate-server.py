@@ -439,6 +439,18 @@ def handle_evaluate(body: dict) -> dict:
                     if skill_name in skip_list:
                         log.info(f"Skipping notification for blacklisted skill: {skill_name}")
                         continue
+                    # Guard: skip if skill_name is empty/unknown (Gemini returned NO_SKILL but wasn't caught)
+                    if not skill_name or skill_name == "unknown" or skill_name.startswith("auto-"):
+                        # Validate the SKILL.md actually has real content
+                        skill_md_path = Path.home() / ".openclaw/workspace/skills/auto-learned" / skill_name / "SKILL.md"
+                        if skill_name.startswith("auto-") and skill_md_path.exists():
+                            skill_md_content = skill_md_path.read_text()
+                            if not skill_md_content.strip().startswith("#"):
+                                log.info(f"Skipping invalid skill (no valid SKILL.md heading): {skill_name}")
+                                continue
+                        elif not skill_md_path.exists():
+                            log.info(f"Skipping skill with missing SKILL.md: {skill_name}")
+                            continue
                     # Quality-gate: only notify for quality >= 40 (low quality stored silently)
                     quality_score = item.get("qualityScore", 0)
                     if quality_score > 0 and quality_score < 40:

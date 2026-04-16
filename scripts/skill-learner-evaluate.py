@@ -633,8 +633,15 @@ def process_queue():
                               or _extract_name_from_result(result)
                               or f"auto-{req_file.stem[:12]}")
 
-                # Extract skill_md block (falls back to full result if no block)
+                # Extract skill_md block
                 skill_content = _extract_skill_md(result)
+
+                # Guard: skip if no valid SKILL.md content was extracted
+                if not skill_content or not skill_content.startswith("#"):
+                    print(f"  ⏭️ No valid SKILL.md block extracted (name would be: {skill_name}), skipping")
+                    request["status"] = "no_skill_md"
+                    req_file.write_text(json.dumps(request, indent=2))
+                    continue
 
                 # Write
                 skill_dir = SKILLS_DIR / skill_name
