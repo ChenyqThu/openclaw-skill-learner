@@ -3,7 +3,9 @@
 本文档面向**可复制部署**设计：定义三轨道自进化系统与宿主 AI Agent 平台之间的集成契约。
 无论宿主是 OpenClaw、Hermes 还是其他 Agent 框架，只要满足以下接口约定即可接入。
 
-> **Phase 4 (2026-04)**：本文档描述的三轨道仍然是系统骨架；在此之上新增了 4 层 supervision loop 改进（A 验证、B 提名、C 丰转录、D 回放、E 跨会话）。Phase 4 需要宿主侧少量新增能力，详见 [OPENCLAW_COOPERATION_PHASE2.md](OPENCLAW_COOPERATION_PHASE2.md)。本文档关注的是**最小可运行契约**，Phase 4 只是强化信号质量，不改变契约骨架。
+> **Phase 4 (2026-04)**：本文档描述的三轨道仍然是系统骨架；在此之上新增了 4 层 supervision loop 改进（A 验证、B 提名、C 丰转录、D 回放、E 跨会话）。
+>
+> **Phase 4 实施方式反转**：最初以为 B.1/C.1.b/C.1.c 需要 OpenClaw 上游 PR；实际 OpenClaw plugin SDK（`openclaw@2026.4.15`）已经提供 `api.registerTool`、`after_tool_call.event.params` 全透传、`subagent_spawned/ended` hooks —— 全部可在 plugin 内完成。详见 [PHASE_4_OPENCLAW_INTEGRATION_REPORT.md](PHASE_4_OPENCLAW_INTEGRATION_REPORT.md) 和 [OPENCLAW_COOPERATION_PHASE2.md](OPENCLAW_COOPERATION_PHASE2.md)。本文档关注的是**最小可运行契约**，Phase 4 只是强化信号质量，不改变契约骨架。
 
 ---
 
@@ -55,13 +57,13 @@
 
 **Phase 4 可选增强**（见 [OPENCLAW_COOPERATION_PHASE2.md](OPENCLAW_COOPERATION_PHASE2.md)）：
 
-| 扩展 | 类型 | 用途 | 降级路径 |
+| 扩展 | 类型 | 状态 (2026-04-17) | 落地方式 |
 |------|------|------|---------|
-| `skill_learner_nominate` 工具 | 新 tool | Agent 主动声明"这次有料" → 外部评估器只处理提名的 session | ✅ 文件写入 polyfill 已生效 |
-| `skill_considered_rejected` hook | 新 hook | 捕获 Agent 考虑但未加载的 skill（负证据） | ❌ 无法 polyfill |
-| `after_tool_call.params` 全透传 | 现有 hook 扩展 | 让评估器看到全部工具参数（脱敏后） | ⚠️ 可经 gateway.log 粗代 |
-| `sub_agent_spawn/complete` events | 新 hook | 让评估器覆盖 `sessions_spawn` 的子 agent | ❌ 无法 polyfill |
-| Headless Jarvis runner | CLI/API | Phase D 回放校验 gate | ⚠️ 可 shell out 到 claude-code |
+| `skill_learner_nominate` 工具 | 新 tool | ✅ **DONE via plugin SDK** | `api.registerTool()` + typebox schema，plugin 内完成，payload 带 `_firstClass: true` |
+| `after_tool_call.params` 全透传 | 现有 hook 扩展 | ✅ **DONE via plugin SDK** | event.params 一直是 `Record<string, unknown>`,plugin 新增 `sanitizeParams`+`appendToolTrace`(cap 40) |
+| `sub_agent_spawn/ended` events | 现有 hooks | ✅ **DONE via plugin SDK** | `subagent_spawned/ended` 三 hook 已在 SDK；plugin 建 parent↔child map，payload 新增 `subagentSummaries` |
+| `skill_considered_rejected` hook | 新 hook | 🟡 需 agent 协作 | 本质是 agent 内部决策，平台不 emit；AGENTS.md 协议 / 新增 `skill_consider_note` 工具 |
+| Headless Jarvis runner | CLI/API | 🟡 未探 `registerAgentHarness` | Phase D 已预留 `HeadlessJarvisClient` 骨架 + shell out 到 claude-code |
 
 ### 2.2 必须提供的文件系统结构
 

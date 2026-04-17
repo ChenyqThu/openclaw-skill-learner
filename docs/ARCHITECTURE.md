@@ -290,6 +290,7 @@ Evolution is expensive (multiple Gemini calls per round). The evolution lock is 
 | 3 (Track 1) | 2026-04-14 | Darwin skill evolution engine, friction detection, 8-dim rubric, git ratchet, workspace git init, gemini_client extraction, Feishu evolution report card |
 | 3 (Track 2) | 2026-04-14 | User modeling analyzer, diary + correction signal attribution, Gemini-powered spec file proposals, profile_approve/reject actions, weekly cron |
 | **4 (Supervision loop redesign)** | **2026-04-17** | A: strict validators at both tiers + rejection-context feedback + extract_skill_md frontmatter bugfix; B: agent self-nomination tool + polyfill + gate `nominated OR friction≥3` + prompt high-trust block + AGENTS.md protocol; C: session JSONL loader + v4_rich_transcript prompt variant; D: replay_gate.py skeleton; E: cross_session_cluster.py skeleton. 11 legacy auto-* drafts cleaned. |
+| **4.1 (SDK-native integration)** | **2026-04-17 (same day)** | Reversed earlier "need OpenClaw upstream PR" position. Plugin SDK (`openclaw@2026.4.15`) already provides everything: `api.registerTool` (B.1), `after_tool_call.event.params` is fully transparent (C.1.b), `subagent_spawned/ended` hooks (C.1.c). Plugin bumped 546→915 lines in-repo. Evaluator now consumes `toolTrace` + `subagentSummaries` payloads; prompt distinguishes first-class nominations (`_firstClass: true`) from polyfill. Only C.1.a (agent internal decision) + D headless runner still need further work. |
 
 ---
 

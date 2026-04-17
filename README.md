@@ -480,12 +480,15 @@ python3 scripts/user_modeling.py --reject <proposal-id>
 - [x] **Phase 4D skeleton** (2026-04): `replay_gate.py` with test-prompt generator, trajectory overlap scorer, dry-run via Gemini self-play
 - [x] **Phase 4E skeleton** (2026-04): `cross_session_cluster.py` for 14-day pattern mining → proactive proposals
 
-### In flight (needs OpenClaw side — see `docs/OPENCLAW_COOPERATION_PHASE2.md`)
-- [ ] **B.1 `skill_learner_nominate` tool** — first-class registration (currently polyfill via file-write)
-- [ ] **C.1.a `skill_considered_rejected` hook** — captures which skills agent rejected (negative evidence)
-- [ ] **C.1.b `after_tool_call.params` full pass-through** with secret redaction allowlist
-- [ ] **C.1.c `sub_agent_spawn/complete` events** — cover `sessions_spawn` handoffs
-- [ ] **D headless Jarvis runner** — replaces `HeadlessJarvisClient` stub for real replay validation
+### Done — Phase 4.1 SDK-native integration (2026-04-17)
+Plugin SDK already provides everything needed; no OpenClaw upstream PR required:
+- [x] **B.1 `skill_learner_nominate` first-class tool** via `api.registerTool()` — agent calls directly, payload carries `_firstClass: true`
+- [x] **C.1.b `after_tool_call.params` full pass-through** — plugin `sanitizeParams` + `appendToolTrace` ring buffer (cap 40)
+- [x] **C.1.c `sub_agent_spawned/ended` hooks** — plugin builds parent↔child runId map; child summaries forward to parent `agent_end` payload
+
+### Still in flight (non-SDK reasons)
+- [ ] **C.1.a `skill_considered_rejected`** — agent's internal decision, platform doesn't emit. Two paths: AGENTS.md protocol + agent self-log, OR new `skill_consider_note` tool in plugin
+- [ ] **D headless Jarvis runner** — could try plugin SDK `api.registerAgentHarness`, or shell out to `claude-code` as polyfill. Phase D skeleton has `HeadlessJarvisClient` waiting
 
 ### Open (no OpenClaw dep)
 - [ ] **Card action handler**: `card_action` hook so skip-with-reason writes directly

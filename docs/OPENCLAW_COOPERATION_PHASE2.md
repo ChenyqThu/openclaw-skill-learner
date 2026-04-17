@@ -1,33 +1,31 @@
 # OpenClaw 侧协作需求 — Phase B / C / D
 
 **对象**：OpenClaw 平台开发 team
-**目的**：为 Skill Learner 的二期重设计补齐宿主侧 hook / tool / 事件接口
+**目的**：历史文档 — 记录 Phase 4 初期以为"必须等 OpenClaw 上游 PR"的能力，实际大半在 plugin SDK 里直接能做。
 
-本文列出 B/C/D 三阶段需要 OpenClaw 侧新增/扩展的能力，以及每项的 **polyfill 降级路径**（我方可先用 polyfill 顶一段时间，OpenClaw 侧按自己节奏推）。
+> **⚡ 2026-04-17 重大修正**：先前"需要 OpenClaw 平台 PR"的判断是错的。OpenClaw 的 plugin SDK 在当前版本（`openclaw@2026.4.15`）已经提供了 B.1 / C.1.b / C.1.c 所需要的全部接口 — `api.registerTool`、`after_tool_call.event.params` 已经全量透传、`subagent_spawned/ended` 三个 hook 全有。详见 `PHASE_4_OPENCLAW_INTEGRATION_REPORT.md`。
 
-## 状态速览 (2026-04-17)
+## 状态速览 (2026-04-17 修正版)
 
-| 项 | 优先级 | 落地状态 | 备注 |
+| 项 | 原先判断 | 当前状态 | 证据 |
 |---|---|---|---|
 | Plugin Phase 2→3 同步 | — | ✅ 完成 | runtime 路径是 `~/.openclaw/extensions/jarvis-skill-learner/`（不是 `~/.openclaw/plugins/`） |
-| **B.1 polyfill 端到端** | — | ✅ **OpenClaw team 验证通过 (2026-04-17)** | HTTP `nominated=true` → gate 放行；文件写入 `nominations/` → plugin 实时 `🎯 Nomination polyfill detected` |
-| AGENTS.md §六 自我提名协议 | — | ✅ 完成 | OpenClaw 侧已注入 |
-| 日记四类信号 cron prompt | — | ✅ 完成 | OpenClaw 侧已注入 |
-| 卡片 timeout=60 | — | ✅ 完成 | OpenClaw 侧 evaluate-server.py 已修 (我方 repo 本就是 60) |
-| **B.1 first-class tool** | P0 | 🔴 需 OpenClaw 上游 PR | polyfill 够用；落地后移除 payload 的 `(polyfill)` 降级标记 |
-| C.1.c sub_agent hooks | P1 | 🔴 需 OpenClaw 上游 PR | 无法 polyfill,是当前最大盲区 |
-| C.1.b params 全透传 | P2 | 🔴 需 OpenClaw 上游 PR | 弱 polyfill: 读 gateway.log (不建议) |
-| C.1.a rejected hook | P3 | 🔴 需 OpenClaw 上游 PR | 无法外部观测,弱 polyfill 信噪比低 |
-| D headless CLI | P4 | 🔴 需 OpenClaw 上游 PR | 降级:skill-learner 侧 shell out 到 claude-code |
+| AGENTS.md §六 自我提名协议 | — | ✅ 完成 | Jarvis 侧已注入 |
+| 日记四类信号 cron prompt | — | ✅ 完成 | Jarvis 侧已注入 |
+| **B.1 first-class tool** | P0 需 PR | ✅ **DONE via plugin SDK** | `api.registerTool()` + typebox schema → 30 行 plugin 代码搞定。agent 可直接调用 `skill_learner_nominate`，payload 带 `_firstClass: true` |
+| **C.1.b params 全透传** | P2 需 PR | ✅ **DONE via plugin SDK** | `after_tool_call.event.params` 一直是 `Record<string, unknown>` 全透传，只是 plugin 以前自己没读。新增 `sanitizeParams` 脱敏 + `appendToolTrace` 环形缓冲 (cap 40) |
+| **C.1.c sub_agent hooks** | P1 需 PR | ✅ **DONE via plugin SDK** | `subagent_spawned` / `subagent_ended` 两个 hook 都在。plugin 建立 parent↔child runId 映射，子 run 的 `agent_end` 把 summary forward 到父 run 的 HTTP payload |
+| C.1.a `skill_considered_rejected` | P3 需 PR | 🟡 仍需 agent 协作 | 本质是 agent 内部决策，平台不 emit。两条路径：AGENTS.md 协议 + agent 主动记录 / plugin 新增 `skill_consider_note` 工具 |
+| D Headless Jarvis CLI | P4 optional | 🟡 未探 `registerAgentHarness` | plugin SDK 有 `api.registerAgentHarness`（`types.d.ts:1628`）理论可从 plugin 侧注册 ephemeral harness。Phase D 骨架已预留 polyfill=shell out 到 `claude-code` |
 
-以下章节是规格原文（优先级 + polyfill 降级路径）。
+以下章节保留当时的规格原文作为历史记录 + 实现参考。已落地的项在章节标题加了 `[DONE]` 前缀指向 plugin 实现。
 
 ---
 
-## B.1 — `skill_learner_nominate` 工具
+## B.1 — `skill_learner_nominate` 工具 `[DONE via plugin SDK]`
 
-**优先级**：P0（决定 Phase B 的核心价值兑现）
-**我方准备度**：plugin 已经能识别 + 转发；prompt + AGENTS.md + 评估器 gate 全部上线。只差工具本身。
+**原判断**：P0（决定 Phase B 的核心价值兑现）
+**实际**：✅ 已在 plugin 内用 `api.registerTool()` 注册完成。不需要 OpenClaw 上游改动。Agent 调用工具即返回 `{queued: <nominationId>}`，文件落盘到 `data/skill-learner/nominations/` + `nomination-log.jsonl` 审计。payload 带 `_firstClass: true` 区分自 polyfill。下文规格保留作为接口参考。
 
 ### 工具规格
 
@@ -97,9 +95,10 @@ OpenClaw team：3-6 小时（工具注册 + 参数校验 + 文件写入 + 审计
 
 ## C.1 — 三项 Hook 扩展（填补关键盲区）
 
-**优先级**：P1（B 落地后才有意义）
+**原判断**：P1（B 落地后才有意义）
+**实际**：C.1.b 和 C.1.c 已在 plugin SDK 内完成；C.1.a 仍需 agent 协作或新工具。
 
-### C.1.a `skill_considered_rejected`
+### C.1.a `skill_considered_rejected` `[仍需 agent 协作]`
 
 **用途**：agent 考虑了某个 skill 但决定不加载 — 这是现在完全不可见的「负证据」。
 
@@ -119,7 +118,10 @@ OpenClaw team：3-6 小时（工具注册 + 参数校验 + 文件写入 + 审计
 
 **价值**：当 agent 后来踩坑时，我们可以反问 "你考虑过 skill X 吗？" 如果答案是 "考虑过但觉得不匹配"，那就是 skill X 的 `when_to_use` 描述得太窄 → Track 1 Darwin 进化的明确驱动信号。
 
-### C.1.b `after_tool_call.params` 全透传 + 脱敏
+### C.1.b `after_tool_call.params` 全透传 + 脱敏 `[DONE via plugin SDK]`
+
+**实际**：OpenClaw `PluginHookAfterToolCallEvent.params` 一直是 `Record<string, unknown>` 全透传，只是 plugin 以前自己没读。已新增 `sanitizeParams()`（REDACT_KEYS 正则 + `Bearer <token>` 替换 + 2000 字截断 + 8 KB 总 cap）+ `appendToolTrace()`（ring buffer cap 40）。payload 新增 `toolTrace` 数组，evaluator 端 `_build_tool_trace_note` 已消费。下文原计划保留作脱敏设计参考。
+
 
 **现状**：plugin 只能读到 Read_tool 的 `params.path`。其他工具（exec/write/edit）的参数完全不可见。
 
@@ -137,7 +139,10 @@ const MAX_STRING_LEN = 2000;
 - write 写到 `skills/` vs `logs/` — 重要性差十倍
 - edit 做的是 typo 修复还是架构变更 — 现在全都等价
 
-### C.1.c `sub_agent_spawn` / `sub_agent_complete`
+### C.1.c `sub_agent_spawn` / `sub_agent_complete` `[DONE via plugin SDK]`
+
+**实际**：OpenClaw plugin SDK 提供 `subagent_spawning` / `subagent_spawned` / `subagent_ended` 三个 hook。Plugin 已注册 `subagent_spawned`（建立 parent↔child runId 映射）+ `subagent_ended`（记录 outcome / error）。子 run 的 `agent_end` 触发后 forward summary 到 `parentSubagentSummaries[parentRunId]`，父 run 的 HTTP payload 新增 `subagentSummaries` 数组。evaluator 端 `_build_subagent_note` 已消费。下文原计划保留作事件命名参考。
+
 
 **现状**：当 jarvis 调 `sessions_spawn` 给 jarvis-exec 干活，子 session 的 transcript 完全隔离，plugin 只看到父 session 的那一个工具调用。对一个需要长链路的 skill 来说，这是最大盲区。
 

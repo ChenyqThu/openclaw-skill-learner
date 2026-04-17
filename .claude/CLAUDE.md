@@ -99,7 +99,8 @@ OMC_SKIP_GATE=1 python3 scripts/evaluate-server.py
 ## Phase 4 产物清单（2026-04-17）
 
 - Phase A（hot-fix）：A.1+A.2+A.3+A.4+A.5+A.6 全部上线
-- Phase B（agent 提名）：B.2-B.5 上线 + polyfill；B.1 待 OpenClaw 工具
-- Phase C（丰转录）：C.2 plugin 转发 + C.3 loader/v4 prompt 上线；C.1 hooks 待 OpenClaw
-- Phase D（回放 gate）：`replay_gate.py` 骨架 + dry-run 模式；真 runner 待 OpenClaw headless
+- Phase B（agent 提名）：B.1-B.5 全部上线;**B.1 first-class 工具已 via plugin SDK `api.registerTool()` 完成**(payload 带 `_firstClass: true`);polyfill 仍保留兼容
+- Phase C（丰转录 + 参数捕获 + 子 agent）：C.2 plugin 转发 + C.3 loader/v4 prompt 上线；**C.1.b `after_tool_call.params` 全透传 + C.1.c `subagent_spawned/ended` 已 via plugin SDK 完成**(plugin 内 `sanitizeParams` + `appendToolTrace` + parent↔child registry);C.1.a 仍需 agent 协作
+- Phase D（回放 gate）：`replay_gate.py` 骨架 + dry-run 模式；真 runner 可用 `api.registerAgentHarness` 或 shell out 到 claude-code
 - Phase E（跨会话）：`cross_session_cluster.py` 骨架 + 置信度评分
+- evaluator 消费 Phase 4.1 payload：`evaluate-server.py` 持久化 `toolTrace` + `subagentSummaries`;`v3_balanced.py` 提供 `_build_tool_trace_note` + `_build_subagent_note` + 三态 nomination 块(first-class / polyfill-full / polyfill-empty)
