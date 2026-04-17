@@ -3,6 +3,8 @@
 本文档面向**可复制部署**设计：定义三轨道自进化系统与宿主 AI Agent 平台之间的集成契约。
 无论宿主是 OpenClaw、Hermes 还是其他 Agent 框架，只要满足以下接口约定即可接入。
 
+> **Phase 4 (2026-04)**：本文档描述的三轨道仍然是系统骨架；在此之上新增了 4 层 supervision loop 改进（A 验证、B 提名、C 丰转录、D 回放、E 跨会话）。Phase 4 需要宿主侧少量新增能力，详见 [OPENCLAW_COOPERATION_PHASE2.md](OPENCLAW_COOPERATION_PHASE2.md)。本文档关注的是**最小可运行契约**，Phase 4 只是强化信号质量，不改变契约骨架。
+
 ---
 
 ## 一、系统架构总览
@@ -47,9 +49,19 @@
 
 | Hook | 触发时机 | 提供的数据 | 用途 |
 |------|---------|-----------|------|
-| `after_tool_call` | 每次工具调用完成后 | toolName, durationMs, error, params | 工具计数、Skill 读取检测、错误追踪 |
-| `agent_end` | 一轮 Agent 执行结束后 | messages (对话历史数组) | 转录提取、摩擦/纠正信号检测 |
+| `after_tool_call` | 每次工具调用完成后 | toolName, durationMs, error, params | 工具计数、Skill 读取检测、错误追踪、Phase B 提名捕获 |
+| `agent_end` | 一轮 Agent 执行结束后 | messages (对话历史数组), 可选 sessionFile | 转录提取、摩擦/纠正信号检测、Phase C 丰转录路径 |
 | `session_end` | 整个会话结束后 | sessionFile (可选) | 健康检查、兜底队列 |
+
+**Phase 4 可选增强**（见 [OPENCLAW_COOPERATION_PHASE2.md](OPENCLAW_COOPERATION_PHASE2.md)）：
+
+| 扩展 | 类型 | 用途 | 降级路径 |
+|------|------|------|---------|
+| `skill_learner_nominate` 工具 | 新 tool | Agent 主动声明"这次有料" → 外部评估器只处理提名的 session | ✅ 文件写入 polyfill 已生效 |
+| `skill_considered_rejected` hook | 新 hook | 捕获 Agent 考虑但未加载的 skill（负证据） | ❌ 无法 polyfill |
+| `after_tool_call.params` 全透传 | 现有 hook 扩展 | 让评估器看到全部工具参数（脱敏后） | ⚠️ 可经 gateway.log 粗代 |
+| `sub_agent_spawn/complete` events | 新 hook | 让评估器覆盖 `sessions_spawn` 的子 agent | ❌ 无法 polyfill |
+| Headless Jarvis runner | CLI/API | Phase D 回放校验 gate | ⚠️ 可 shell out 到 claude-code |
 
 ### 2.2 必须提供的文件系统结构
 
@@ -96,15 +108,24 @@
 
 运行着外部自进化系统（Skill Learner 插件），通过 Plugin Hook 自动运作：
 
-- 轨道 0：agent_end 自动触发 Skill 评估，候选通知审批
+- 轨道 0：agent_end 触发 Skill 评估（Phase B 起:需 nominated 或 friction≥3）,候选通知审批
 - 轨道 1：摩擦信号触发 Darwin 8 维评分 + 棘轮优化，改进 auto-commit
 - 轨道 2：每周分析日记 + 纠正信号，生成规范文件更新提案
 
 配合义务：
+- Session 结束前审视是否触发「自我提名协议」四条之一（走弯路/非显然组合/踩坑/主动换方案）→ 是就调 skill_learner_nominate
 - 日记中标记 [偏好]/[纠正]/[决策]/[反馈] 四类信号
 - 不手动修改 skills/ 下的 .eval.json / .meta.json
 - 不对 workspace git 执行 reset --hard 或 clean -f
 ```
+
+**Phase 4 新增:自我提名协议**（完整版见 [OPENCLAW_COOPERATION_PHASE2.md §B.1](OPENCLAW_COOPERATION_PHASE2.md) + OpenClaw AGENTS.md §六）。核心要求:
+
+- 工具名:`skill_learner_nominate`
+- 必填:topic / pain_point / reusable_pattern / confidence
+- 触发条件:走弯路被纠正 / 非显然 ≥3 工具组合 / 踩坑 / 主动换方案
+- 上限:3 次/run
+- 降级:工具未注册时 agent 用 `exec` 写 JSON 到 `data/skill-learner/nominations/`，plugin 会检测并转发
 
 ### 3.2 日记信号标记规范
 
@@ -151,7 +172,7 @@ Track 1 棘轮依赖 git。宿主需要：
 | 5 | 安装 Track 0 批量 cron | `cp ai.openclaw.skill-learner.plist ~/Library/LaunchAgents/ && launchctl load ...` | — |
 | 6 | 安装 Track 1 进化 cron | `cp ai.openclaw.skill-evolution-cron.plist ~/Library/LaunchAgents/ && launchctl load ...` | — |
 | 7 | 安装 Track 2 建模 cron | `cp ai.openclaw.user-modeling-cron.plist ~/Library/LaunchAgents/ && launchctl load ...` | — |
-| 8 | 同步 Plugin | `cp plugin/index.js ~/.openclaw/plugins/jarvis-skill-learner/` | — |
+| 8 | 同步 Plugin | **不要直接 `cp`**;runtime 加载点是 `~/.openclaw/extensions/jarvis-skill-learner/`(由 `openclaw plugins install` 从 path source 安装)。正确做法:`rm -rf ~/.openclaw/extensions/jarvis-skill-learner && openclaw plugins install <repo>/plugin && openclaw gateway restart`,验证 gateway.log 出现 `Plugin registered (Phase 3: Self-Evolution)` | — |
 | 9 | 更新 AGENTS.md | 写入三轨道运行指令（见 §3.1） | Agent review 能看到 |
 | 10 | 更新日记 cron prompt | 注入四类信号标记指令（见 §3.2） | 次日日记包含 `## 自进化信号` |
 

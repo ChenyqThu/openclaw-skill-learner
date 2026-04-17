@@ -2,12 +2,14 @@
 
 **Auto-learn and self-evolve reusable skills from agent sessions.**
 
-An OpenClaw plugin that brings Hermes-style self-evolution to the OpenClaw ecosystem — without modifying OpenClaw's source code. Now with Darwin-style skill evolution (Track 1).
+An OpenClaw plugin that brings Hermes-style self-evolution to the OpenClaw ecosystem — without modifying OpenClaw's source code. Now with Darwin-style skill evolution (Track 1) and agent-nominated learning + replay validation (Phase 4).
 
-> **Current Version**: Phase 3 (Track 0 + Track 1 Darwin Evolution)
+> **Current Version**: Phase 4 (Supervision Loop Redesign)
+> — Track 0/1/2 + Agent Self-Nomination + Rejection Feedback + Replay Gate + Cross-Session Pattern Mining
 > **Evaluation Accuracy**: 88.9/100 (v3 prompt, 16/18 correct on labeled test set)
 > **Evolution Engine**: 8-dimension scoring + hill-climbing ratchet
 > **Full project doc**: [OpenClaw Skill Learner — 项目文档 & 实现全记录](https://www.feishu.cn/wiki/OqW8wQhj6iJbZnkbMxWcNzLgnlb)
+> **Phase 4 design**: [plan file](../../../.claude/plans/review-openclaw-effervescent-squid.md) · **OpenClaw-side spec**: [OPENCLAW_COOPERATION_PHASE2.md](docs/OPENCLAW_COOPERATION_PHASE2.md)
 
 ---
 
@@ -17,32 +19,44 @@ An OpenClaw plugin that brings Hermes-style self-evolution to the OpenClaw ecosy
 Your conversations with Jarvis
   │
   ├── after_tool_call hook → counts tools, detects SKILL.md reads,
-  │                          tracks errors + friction signals (Track 1)
-  ├── agent_end hook → if ≥8 calls: HTTP POST → localhost:8300/evaluate
-  │                    scans user messages for friction keywords
+  │                          tracks errors + friction signals,
+  │                          captures skill_learner_nominate (Phase B) + polyfill
+  ├── agent_end hook → if ≥15 calls AND (nominated OR friction≥3):
+  │                    HTTP POST → localhost:8300/evaluate
+  │                    (Phase 4 gate — otherwise 202 skipped, no Gemini call)
   └── session_end hook → memory health check + fallback queue write
                                     │
                    ┌────────────────┴────────────────┐
                    │                                 │
             triggerEvolution?                  Standard eval
-            frictionSkill?                    (Track 0: unchanged)
+            frictionSkill?                    (Track 0 + Phase A validators)
                    │                                 │
             POST /evolve                     Gemini 3 Flash API
             skill_evolution.py               eval_json + skill_md
                    │                                 │
-            Darwin 8-dim rubric              Pre-filter + Deviation Test
-            (structure 60 + effect 40)              │
-                   │                    ┌───────────┼───────────┐
-            ┌──────┴──────┐             │           │           │
-         KEEP → git commit    New Skill?    Update?     NO_SKILL
-         DROP → git revert    quality_score quality_score
-                   │              │           │
-            Feishu 🧬 进化卡片    skills/auto-learned/  .update-proposal.md
-            [✅ 确认] [↩️ 回滚]         │           │
-                                  Quality gate: ≥40 → notify
-                                        │
-                                  Feishu 🧠 Skill 候选卡片
-                                  [✅ 通过落地] [💬 讨论] [⏭ 跳过]
+            Darwin 8-dim rubric              Pre-filter + Deviation Test +
+            (structure 60 + effect 40)        Rejection-context injection (A.4)
+                   │                                 │
+            ┌──────┴──────┐                   _validate_skill_candidate()
+         KEEP → git commit                    6 hard checks (A.1):
+         DROP → git revert                      name, frontmatter, ≥3 sections,
+                   │                             problem_ctx≥20, approach≥30,
+            Feishu 🧬 进化卡片                   quality≥40
+            [✅ 确认] [↩️ 回滚]                        │
+                                         skills/auto-learned/ drafts
+                                               │
+                                    _validate_eval_card_ready (A.2)
+                                               │
+                              [opt] Phase D replay gate (replay_gate.py)
+                                               │
+                                       Feishu 🧠 Skill 候选卡片
+                                       [✅ 通过落地] [💬 讨论] [⏭ 跳过 --reason "..."]
+                                               │
+                                   skip/discuss → rejection-context.json (A.3)
+                                   → next Gemini prompt reads as negative examples
+
+(Parallel) Phase E: cron scans analysis-queue every 14 days → Gemini clustering
+  → ≥3 similar sessions → proactive-proposal-*.json → approval card
 ```
 
 ---
@@ -109,10 +123,28 @@ Metadata is encoded in button `name` (`verb||base64(skill_name)||action`) — no
 - **Memory health monitoring**: Warns when `MEMORY.md` approaches size limits
 - **Tool usage statistics**: Per-tool call count, error rate, and duration — rolling 30-day window
 
+### 🎯 Phase 4: Supervision Loop Redesign (new 2026-04-17)
+
+Fixes the two root failure modes of Track 0: *empty/malformed drafts leaking as Feishu cards* and *no useful suggestions because external inference lacks agent intent*.
+
+**Four reinforcing layers** (see `/docs/OPENCLAW_COOPERATION_PHASE2.md` for the OpenClaw-side specs):
+
+| Layer | What it does | Shipped |
+|-------|-------------|---------|
+| **A. Validators (hot-fix)** | `_validate_skill_candidate` in evaluator (6 hard checks) + `_validate_eval_card_ready` in server. Both reject malformed Gemini output before it can reach Feishu. Pre-existing `extract_skill_md` bug rejecting frontmatter drafts also fixed. | ✅ Live |
+| **B. Agent nomination** | Jarvis self-calls `skill_learner_nominate` when a session meets 4 defined conditions. Evaluator only runs Gemini when `nominated OR friction≥3` (else returns 202 skipped). Rate-capped 3/run. Polyfill via file-write for agents without the tool. | ✅ Live + polyfill |
+| **C. Rich transcript** | `load_full_session_transcript()` reads session JSONL with 30k-char budget, prioritizes `evidence_turns`. Opt-in via `PROMPT_VERSION=v4_rich_transcript`. Gemini outputs cite specific `turn N` references. | ✅ Skeleton (needs OpenClaw hooks for full value) |
+| **D. Replay gate** | `replay_gate.py` generates test prompts from originating session → runs them against new SKILL.md → requires ≥50% skill-load rate + ≥60% trajectory overlap before card fires. Dry-run uses Gemini self-play when headless Jarvis unavailable. | ✅ Skeleton (real runner needs OpenClaw headless mode) |
+| **E. Cross-session mining** | `cross_session_cluster.py` scans 14-day queue → Gemini clusters by abstract intent → ≥3 matching sessions produce proactive proposals. Confidence = f(size, temporal_span, pattern_consistency). | ✅ Skeleton |
+
+**Feedback loop**: `rejection-context.json` (FIFO 50 entries, 30-day decay) captures every skip/discuss with user reason. Next Gemini prompt reads last 10 entries and is instructed to output NO_SKILL if the abstract pattern matches.
+
 ### 🔒 Security Design
 - Plugin contains **zero network calls** (passes OpenClaw's security scanner)
 - All Gemini API calls happen in the external evaluator script or evaluate-server
 - Skill drafts require human approval before activation
+- Phase A.1 validators block structurally invalid drafts from reaching disk
+- Phase B gate drops untrusted sessions before any Gemini call (cost + noise control)
 
 ---
 
@@ -121,6 +153,15 @@ Metadata is encoded in button `name` (`verb||base64(skill_name)||action`) — no
 ### 1. Install the Plugin
 
 ```bash
+openclaw plugins install ./plugin
+openclaw gateway restart
+# Verify: gateway.log should print `Plugin registered (Phase 3: Self-Evolution)`
+```
+
+⚠️ **Upgrade pitfall** — plugins installed via `openclaw plugins install` land at `~/.openclaw/extensions/jarvis-skill-learner/` (NOT `~/.openclaw/plugins/`). Never `cp` into `~/.openclaw/plugins/` — the runtime won't see it. To force a re-sync after editing `plugin/index.js`:
+
+```bash
+rm -rf ~/.openclaw/extensions/jarvis-skill-learner
 openclaw plugins install ./plugin
 openclaw gateway restart
 ```
@@ -173,18 +214,24 @@ python3 scripts/skill-learner-evaluate.py --dry-run  # preview only
 
 | Constant | Default | Description |
 |----------|---------|-------------|
-| `TOOL_CALL_THRESHOLD` | `8` | Minimum tool calls to mark for analysis |
+| `TOOL_CALL_THRESHOLD` | `15` | Lower bound for evaluation (Phase A.6 raised from 8) |
 | `FRICTION_THRESHOLD` | `4` | Friction weight to trigger evolution |
+| Nomination cap | `3/run` | Max `skill_learner_nominate` calls per run (hard-coded) |
 | `EVALUATE_SERVER_URL` | `http://127.0.0.1:8300/evaluate` | Real-time eval server endpoint |
 | `MEMORY_LINE_WARN` | `250` | MEMORY.md line warning threshold |
 | `MEMORY_LINE_DANGER` | `300` | MEMORY.md line danger threshold |
 
-### Evaluator (`scripts/skill-learner-evaluate.py`)
+### Evaluator (`scripts/skill-learner-evaluate.py` + `evaluate-server.py`)
 
-| Constant | Default | Description |
+| Constant / Env | Default | Description |
 |----------|---------|-------------|
 | `GEMINI_MODEL` | `gemini-3-flash-preview` | Gemini model for evaluation |
-| `PROMPT_VERSION` | (env var) | Pluggable prompt version (e.g., `v3_balanced`) |
+| `PROMPT_VERSION` | (env var) | Pluggable prompt version (e.g., `v3_balanced`, `v4_rich_transcript`) |
+| `FRICTION_FALLBACK_MIN` | `3` | Phase B gate: friction≥3 opens gate when not nominated |
+| `OMC_SKIP_GATE` | `""` | Set to `"1"` to bypass Phase B gate (emergency/debug) |
+| `OMC_RICH_BUDGET` | `30000` | Char budget for v4 rich transcript prompt |
+| `REJECTION_CONTEXT_MAX` | `50` (FIFO) | Max entries in `rejection-context.json` |
+| `REJECTION_CONTEXT_MAX_DAYS` | `30` | Auto-prune threshold |
 
 ### Quality Gate Thresholds
 
@@ -216,10 +263,13 @@ scripts/
 ├── config.py                         # Shared configuration (paths, constants)
 ├── run-skill-learner.sh              # Wrapper for cron/launchd
 ├── state-arc-analyzer.py             # User state arc analysis (Phase 2D)
+├── replay_gate.py                    # Phase 4D: replay validation gate for drafts (skeleton)
+├── cross_session_cluster.py          # Phase 4E: 14-day pattern mining → proactive proposals
 ├── prompts/                          # Pluggable prompt versions
 │   ├── v1_baseline.py                #   Original prompt (baseline)
 │   ├── v2_recall_dedup.py            #   Recall + dedup improvements
-│   └── v3_balanced.py                #   Production prompt (88.9/100)
+│   ├── v3_balanced.py                #   Production prompt (88.9/100) — now with A.4 rejection ctx + B.4 nomination block
+│   └── v4_rich_transcript.py         #   Phase 4C: rich transcript + turn citations (opt-in)
 ├── test-cases/                       # Labeled test dataset (18 cases)
 │   ├── should-extract/               #   Ground truth = YES (8 cases)
 │   ├── should-reject/                #   Ground truth = NO (6 cases)
@@ -239,7 +289,13 @@ ai.openclaw.user-modeling-cron.plist  # launchd: weekly user modeling (Mon 5:00 
 ```
 ~/.openclaw/workspace/
 ├── data/skill-learner/
-│   ├── analysis-queue/         # Pending session JSON files
+│   ├── analysis-queue/         # Pending session JSON files (Phase B: carries nominated + frictionWeight)
+│   ├── nominations/            # Phase B.1 polyfill drop zone: {runId}-{ts}.json
+│   ├── proactive-proposals/    # Phase E: cross-session clustering outputs
+│   ├── rejection-context.json  # Phase A.3: FIFO 50 skip/discuss entries (30-day decay)
+│   ├── skipped-skills.json     # Phase A.3: persistent skill-name blacklist
+│   ├── friction-signals.json   # Track 1 friction log
+│   ├── correction-signals.json # Track 2 correction log
 │   ├── tool-usage-stats.json   # Daily tool usage statistics
 │   ├── memory-health.json      # Latest memory health check
 │   ├── server.log              # evaluate-server log
@@ -249,7 +305,8 @@ ai.openclaw.user-modeling-cron.plist  # launchd: weekly user modeling (Mon 5:00 
     │   ├── {skill-name}/
     │   │   ├── SKILL.md        # Skill draft
     │   │   ├── .meta.json      # Creation metadata
-    │   │   └── .eval.json      # Structured Gemini evaluation (for card display)
+    │   │   ├── .eval.json      # Structured Gemini evaluation (for card display)
+    │   │   └── .replay.json    # Phase D: replay verdict (when gate is active)
     │   └── .pending-review.json
     └── {existing-skill}/       # Approved skills (git-tracked)
         ├── SKILL.md            # Evolved by Track 1
@@ -409,15 +466,32 @@ python3 scripts/user_modeling.py --reject <proposal-id>
 
 ## Roadmap
 
-- [x] ~~**Track 2: User modeling** — auto-propose USER.md/SOUL.md updates from diary + conversation attribution~~ (done: Phase 3)
-- [ ] **Card action handler**: Implement `card_action` plugin hook for button clicks
+### Done
+- [x] **Track 0**: session → Gemini eval → candidate → approval (Phase 2)
+- [x] **Track 1: Darwin evolution**: 8-dim scoring + hill-climbing ratchet for SKILL.md (Phase 3)
+- [x] **Track 2: User modeling**: auto-propose USER.md/SOUL.md updates (Phase 3)
+- [x] **Darwin prompt optimization**: Hill-climbing with labeled test set (v3, 88.9/100)
+- [x] **Quality scoring**: 0-100 score driving notification strategy
+- [x] **Data-driven pre-filter**: Replace keyword heuristic with feature analysis (0% false negative)
+- [x] **Workspace git initialization**: Git-track skills/ for ratchet mechanism
+- [x] **Phase 4A** (2026-04): Strict validators eliminate empty/malformed Feishu cards; rejection-context feedback loop; red-flag relaxation; `extract_skill_md` frontmatter bug fixed
+- [x] **Phase 4B** (2026-04): Agent self-nomination via `skill_learner_nominate` + polyfill; `nominated OR friction≥3` gate; prompt high-trust block; AGENTS.md self-nomination protocol
+- [x] **Phase 4C skeleton** (2026-04): `load_full_session_transcript` + `v4_rich_transcript` prompt (opt-in via `PROMPT_VERSION`)
+- [x] **Phase 4D skeleton** (2026-04): `replay_gate.py` with test-prompt generator, trajectory overlap scorer, dry-run via Gemini self-play
+- [x] **Phase 4E skeleton** (2026-04): `cross_session_cluster.py` for 14-day pattern mining → proactive proposals
+
+### In flight (needs OpenClaw side — see `docs/OPENCLAW_COOPERATION_PHASE2.md`)
+- [ ] **B.1 `skill_learner_nominate` tool** — first-class registration (currently polyfill via file-write)
+- [ ] **C.1.a `skill_considered_rejected` hook** — captures which skills agent rejected (negative evidence)
+- [ ] **C.1.b `after_tool_call.params` full pass-through** with secret redaction allowlist
+- [ ] **C.1.c `sub_agent_spawn/complete` events** — cover `sessions_spawn` handoffs
+- [ ] **D headless Jarvis runner** — replaces `HeadlessJarvisClient` stub for real replay validation
+
+### Open (no OpenClaw dep)
+- [ ] **Card action handler**: `card_action` hook so skip-with-reason writes directly
 - [ ] **SCAN layer**: Embed security scan into eval pipeline
 - [ ] **Fallback model**: Automatic Gemini model fallback on rate limits
-- [x] ~~**Track 1: Darwin evolution**: 8-dim scoring + hill-climbing ratchet for SKILL.md~~ (done: Phase 3)
-- [x] ~~**Darwin prompt optimization**: Hill-climbing with labeled test set~~ (done: v3, 88.9/100)
-- [x] ~~**Quality scoring**: 0-100 score driving notification strategy~~ (done: quality_score in eval_json)
-- [x] ~~**Data-driven pre-filter**: Replace keyword heuristic with feature analysis~~ (done: 0% false negative)
-- [x] ~~**Workspace git initialization**: Git-track skills/ for ratchet mechanism~~ (done: 21 SKILL.md tracked)
+- [ ] **Phase E cron**: launchd plist for weekly cross-session clustering
 
 ---
 

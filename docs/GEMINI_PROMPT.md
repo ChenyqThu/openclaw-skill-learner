@@ -20,7 +20,8 @@ Our prompt extends this with structured output, OpenClaw-specific context, a man
 |---------|-------|-------------|
 | v1_baseline | 66.6/100 | Original prompt from Phase 2, no system context |
 | v2_recall_dedup | 65.7/100 | +recall (pattern focus, debugging examples), -precision (too aggressive) |
-| **v3_balanced** | **88.9/100** | +Deviation Test, +false positive guards, balanced recall/precision |
+| **v3_balanced** | **88.9/100** (+A/B patches) | +Deviation Test, +false positive guards, balanced recall/precision. Phase 4 adds A.4 rejection-context injection + A.5 cron red-flag relaxation + A.6 quality score weight correction + B.4 nomination block. |
+| v4_rich_transcript | — (opt-in) | Phase 4C variant: reads full session JSONL via `load_full_session_transcript` (30k char budget, prioritizes `evidence_turns`), requires Gemini to cite `event_ref: "turn N"` in key_patterns. Degrades to v3 when no sessionFile. Enable with `PROMPT_VERSION=v4_rich_transcript`. |
 
 Prompts are stored in `scripts/prompts/` and loaded via `PROMPT_VERSION` env var.
 
@@ -84,6 +85,86 @@ Prompts are stored in `scripts/prompts/` and loaded via `PROMPT_VERSION` env var
   ```eval_json  → structured data + quality_score (0-100)
   ```skill_md   → SKILL.md content
 ```
+
+## Phase 4 Prompt Enrichments (applied on top of v3)
+
+### A.4 — rejection-context injection
+
+Loads the last 10 entries from `~/.openclaw/workspace/data/skill-learner/rejection-context.json` and injects them as negative examples. Helper: `_load_recent_rejections_note()` in `v3_balanced.py`.
+
+```
+━━━ 用户已拒绝的历史提议 (不要重复) ━━━
+- 曾提议「X」被 skip（原因: 过于特定）；原问题: Y ...
+- 曾提议「X'」被 discuss（原因: 抽象层错）；...
+...
+如果本次 session 的模式在抽象层与上述任一被拒提议相同，应输出 NO_SKILL。
+判断的是「抽象模式」，不是「表面话题」
+```
+
+### A.5 — cron red-flag relaxation
+
+Old rule rejected any cron session that succeeded. New rule only rejects linear single-branch crons:
+
+```
+• Cron/scheduled task that ran as a LINEAR, SINGLE-BRANCH tool chain:
+  no sub-agent spawns, no fallback branches, no retries, no source failures that required recovery.
+  NOTE: cron tasks that orchestrate multi-hop parallel work, recover from partial source failures,
+  combine tools in non-obvious ways, OR made a course-correction mid-run CAN qualify.
+  Evaluate on DEVIATION / RECOVERY, not on whether the cron finished.
+```
+
+### A.6 — quality_score weight correction
+
+The original template asked for stringified values (`"<1-10>"`) with weights summing to 100 but multiplied by 1-10 — giving a theoretical max of 1000. Fixed to unquoted ints with correct weights:
+
+```
+"quality_score": {
+  "reusability": <1-10 整数>,
+  "insight_depth": <1-10 整数>,
+  "specificity": <1-10 整数>,
+  "pitfall_coverage": <1-10 整数>,
+  "completeness": <1-10 整数>,
+  "total": <0-100 整数, 五项加权总分: reusability×2.5 + insight_depth×2.5 + specificity×2.0 + pitfall_coverage×1.5 + completeness×1.5>
+}
+```
+
+Evaluator/server both also run `_coerce_int` defensively so string outputs are still accepted.
+
+### B.4 — nomination high-trust block
+
+When the plugin captured a `skill_learner_nominate` call, the request payload carries `nominated=true` plus the full `nominationPayload`. The prompt lifts this into an explicit trust signal:
+
+```
+━━━ AGENT SELF-NOMINATION (高信任信号) ━━━
+Jarvis 在本次 session 结束前主动调用了 skill_learner_nominate。
+  Topic: ...
+  Pain point: ...
+  Reusable pattern: ...
+  Confidence: high|medium|low
+  Evidence turns: turn 5, turn 12, turn 18
+
+权重说明：Agent 自证发现了可沉淀模式,这是比外部观察更可靠的信号。
+  • 若 session 内容能支持 Jarvis 的自述 → 倾向 QUALIFY
+  • 若 session 与 nomination 完全不匹配 → 仍可 NO_SKILL
+  • confidence=low 的 nomination 需要更强 session 佐证才 qualify
+```
+
+Polyfill case (agent wrote the file via `exec` but plugin couldn't capture the JSON payload) uses a reduced block — the gate still opens but the prompt doesn't get the trusted topic/pattern details.
+
+### C — v4_rich_transcript full session loader
+
+Activated via `PROMPT_VERSION=v4_rich_transcript`. Behavior differences:
+
+1. When `request.sessionFile` points to a JSONL path, `load_full_session_transcript()` is called with:
+   - `max_chars = int(os.environ.get("OMC_RICH_BUDGET", "30000"))`
+   - `priority_turns = nominationPayload.evidence_turns`
+2. Rich transcript is inserted before `━━━ WHAT IS AN OPENCLAW SKILL ━━━`
+3. Grounding directive requires `key_patterns` to cite specific `turn N` references
+4. Falls back to v3 behavior when no sessionFile
+
+Update-path prompts still route to v3 until C.3 extends them.
+
+---
 
 ## Update Skill Prompt Structure
 

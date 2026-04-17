@@ -107,6 +107,44 @@ Cards are only sent when `quality_score.total >= 40`. Skills with lower scores a
 
 The quality score is displayed in the card header (e.g., `🧠 Skill 候选 · 新建 · resilient-pipeline · 67分`) and in the collapsed details panel.
 
+### Phase 4 Additional Gate Layers
+
+Phase A introduces **two-tier validation before the quality gate** to stop the ~5% stream of malformed Feishu cards seen prior to April 2026:
+
+1. **A.1 evaluator-side** (`_validate_skill_candidate`) — rejects drafts at write time:
+   - `skill_name` must not be empty, `auto-*` prefix, or literal `"unknown"`
+   - `skill_content` must have `---` frontmatter with open + close markers
+   - Must contain ≥3 of the 6 canonical section headers (适用场景 / 不适用场景 / 操作步骤 / 示例 / 已知雷区 / 验证方式)
+   - `eval_data.problem_context` ≥20 chars; `recommended_approach` ≥30 chars
+   - `quality_score.total` ≥ 40 (coerced from string defensively)
+   - On fail: status = `no_skill_name` | `no_skill_md` | `incomplete_skill_md` | `shallow_eval_json` | `low_quality`; nothing written to disk.
+
+2. **A.2 server-side** (`_validate_eval_card_ready`) — rejects cards before sending:
+   - `skill_name` starts with `auto-` / `unknown` / empty → skip
+   - `quality_score < 40` → skip (strict; no more `> 0 AND < 40` half-bug)
+   - Re-reads `.eval.json` on disk and requires `problem_context ≥20`, `recommended_approach ≥30`, `when_to_use ≥2`, `key_patterns ≥1`
+
+### Skip-with-reason Feedback Loop (Phase A.3)
+
+The Skip button's outcome now writes to `rejection-context.json` (FIFO 50 entries, 30-day auto-prune):
+
+```json
+{
+  "skillName": "...",
+  "action": "skip" | "discuss",
+  "rejectedAt": "ISO-8601",
+  "reason": "user-supplied or 'user clicked skip (no comment)'",
+  "originalProblemContext": "...",
+  "originalRecommendedApproach": "...",
+  "sourceSessionRunId": "...",
+  "promptNegativeExample": "曾提议「X」被 skip(原因:...)；原问题:Y；避免再次提出此类抽象模式"
+}
+```
+
+Whatever text the user types in the card's input box is routed to `skill_action.py skip --reason "..."`. When no text is provided, a default reason is recorded. If OpenClaw's `card_action` hook eventually lands, the full reason goes straight through; until then the plain-skip path writes a stub entry that's still useful for Gemini's negative-example list.
+
+The next Gemini evaluation reads the last 10 rejection entries and is instructed to output `NO_SKILL` when the *abstract pattern* (not surface topic) overlaps.
+
 ---
 
 # 🧬 Skill 进化报告 (Track 1)
