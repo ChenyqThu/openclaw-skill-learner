@@ -23,6 +23,7 @@ import os
 import shutil
 import subprocess
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
@@ -32,10 +33,100 @@ SKILLS_DIR    = WORKSPACE / "skills"
 
 FEISHU_TARGET_OPEN_ID = "ou_8d1ce0fa1d435070ed695baeabe25adc"
 SKIP_LIST_FILE = Path.home() / ".openclaw/workspace/data/skill-learner/skipped-skills.json"
+REJECTION_CONTEXT_FILE = Path.home() / ".openclaw/workspace/data/skill-learner/rejection-context.json"
+REJECTION_CONTEXT_MAX = 50            # FIFO cap
+REJECTION_CONTEXT_MAX_DAYS = 30       # entries older than this get pruned on write
 
 
 def log(msg: str):
     print(f"[skill_action] {msg}", flush=True)
+
+
+def _append_rejection(skill_name: str, action: str, reason: str, draft_dir: Path) -> None:
+    """Append a rejection entry to rejection-context.json so Gemini learns what NOT to propose.
+
+    Entry shape:
+      {
+        "skillName": ..., "action": "skip"|"discuss", "rejectedAt": ISO-8601,
+        "reason": <user's free text or default>,
+        "originalProblemContext": ..., "originalRecommendedApproach": ...,
+        "sourceSessionRunId": ...,
+        "promptNegativeExample": "1-line takeaway for next Gemini prompt"
+      }
+
+    Prunes entries older than 30 days and FIFO-caps at 50 on every write.
+    """
+    now = datetime.now(timezone.utc)
+    eval_data: dict = {}
+    eval_path = draft_dir / ".eval.json"
+    if eval_path.exists():
+        try:
+            eval_data = json.loads(eval_path.read_text())
+        except Exception as e:
+            log(f"Warning: could not read {eval_path}: {e}")
+
+    original_context = (eval_data.get("problem_context") or "").strip()[:120]
+    original_approach = (eval_data.get("recommended_approach") or "").strip()[:160]
+    source_request = eval_data.get("sourceRequest") or ""
+    # Derive runId from sourceRequest filename (queue ids look like 1776358252319-ynbbie.json)
+    source_run_id = source_request.rsplit(".", 1)[0] if source_request else ""
+
+    user_reason = (reason or "").strip() or (
+        "user clicked skip (no comment)" if action == "skip" else "user requested discussion"
+    )
+
+    negative_example_parts = [
+        f"曾提议「{skill_name}」被 {action}（原因：{user_reason[:80]}）"
+    ]
+    if original_context:
+        negative_example_parts.append(f"原问题：{original_context}")
+    if action == "skip":
+        negative_example_parts.append("避免再次提出此类抽象模式")
+    elif action == "discuss":
+        negative_example_parts.append("用户对此模式有保留，需改进后再提")
+    negative_example = "；".join(negative_example_parts)
+
+    entry = {
+        "skillName": skill_name,
+        "action": action,
+        "rejectedAt": now.isoformat(),
+        "reason": user_reason,
+        "originalProblemContext": original_context,
+        "originalRecommendedApproach": original_approach,
+        "sourceSessionRunId": source_run_id,
+        "promptNegativeExample": negative_example,
+    }
+
+    # Load + prune + append + cap
+    existing: list = []
+    if REJECTION_CONTEXT_FILE.exists():
+        try:
+            existing = json.loads(REJECTION_CONTEXT_FILE.read_text())
+            if not isinstance(existing, list):
+                existing = []
+        except Exception:
+            existing = []
+
+    cutoff = now - timedelta(days=REJECTION_CONTEXT_MAX_DAYS)
+    def _keep(e: dict) -> bool:
+        ts = e.get("rejectedAt", "")
+        try:
+            dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt >= cutoff
+        except Exception:
+            return False  # malformed entries drop on prune
+
+    existing = [e for e in existing if _keep(e)]
+    existing.append(entry)
+    # FIFO cap: keep newest REJECTION_CONTEXT_MAX
+    if len(existing) > REJECTION_CONTEXT_MAX:
+        existing = existing[-REJECTION_CONTEXT_MAX:]
+
+    REJECTION_CONTEXT_FILE.parent.mkdir(parents=True, exist_ok=True)
+    REJECTION_CONTEXT_FILE.write_text(json.dumps(existing, ensure_ascii=False, indent=2))
+    log(f"rejection-context: +1 ({action}) {skill_name} → {len(existing)} entries")
 
 
 def load_env():
@@ -140,12 +231,18 @@ def do_approve(skill_name: str, message_id: str | None):
     return 0
 
 
-def do_skip(skill_name: str, message_id: str | None):
+def do_skip(skill_name: str, message_id: str | None, reason: str = ""):
     draft = AUTO_LEARNED / skill_name
+
+    # Phase A.3: capture rejection context BEFORE deleting the draft.
+    # `_append_rejection` will read `.eval.json` if present.
     if draft.exists():
+        _append_rejection(skill_name, "skip", reason, draft)
         shutil.rmtree(draft)
         log(f"Deleted draft: {draft}")
     else:
+        # Still record a bare-bones rejection so future prompts know the name was refused.
+        _append_rejection(skill_name, "skip", reason, draft)
         log(f"Draft not found (already deleted?): {draft}")
 
     # Write to skip blacklist so server won't re-suggest this skill name
@@ -223,6 +320,10 @@ def do_discuss(skill_name: str, message_id: str | None, note: str):
         openclaw_send(message=f"⚠️ Skill 草稿不存在：`{skill_name}`")
         return 1
 
+    # Phase A.3: persist the note as a rejection-context entry so Gemini learns from it.
+    # Discuss keeps the draft (doesn't delete) — user wants to iterate, not reject outright.
+    _append_rejection(skill_name, "discuss", note, draft)
+
     # Update card to discussion state
     if message_id:
         done_card = build_done_card(skill_name, "讨论中", note=note or "等待进一步讨论")
@@ -275,12 +376,13 @@ def main():
     parser.add_argument("skill_name", help="Skill name or proposal ID")
     parser.add_argument("--message-id", default=None, help="Feishu message_id of the card")
     parser.add_argument("--note", default="", help="Note for discuss action")
+    parser.add_argument("--reason", default="", help="Rejection reason for skip action (goes to rejection-context.json)")
     args = parser.parse_args()
 
     if args.action == "approve":
         sys.exit(do_approve(args.skill_name, args.message_id))
     elif args.action == "skip":
-        sys.exit(do_skip(args.skill_name, args.message_id))
+        sys.exit(do_skip(args.skill_name, args.message_id, args.reason))
     elif args.action == "discuss":
         sys.exit(do_discuss(args.skill_name, args.message_id, args.note))
     elif args.action == "revert":

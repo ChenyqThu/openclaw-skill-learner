@@ -75,12 +75,19 @@ def extract_eval_json(result: str) -> dict:
 
 
 def extract_skill_md(result: str) -> str:
-    """Extract the ```skill_md``` block. Returns empty string if no valid skill found."""
+    """Extract the ```skill_md``` block. Returns empty string if no valid skill found.
+
+    A valid SKILL.md may begin with either:
+      - YAML frontmatter (``---\\nname: ...\\n---``), which matches the prompt template, OR
+      - A bare markdown heading (``# name``) when the model omits the frontmatter block.
+
+    Historically this function only accepted ``#``, which rejected every frontmatter-style
+    output the prompt explicitly requests (Phase A fix — 2026-04).
+    """
     m = re.search(r'```skill_md\s*\n(.*?)\n```', result, re.DOTALL)
     if m:
         content = m.group(1).strip()
-        # Validate: real SKILL.md should start with a markdown heading
-        if content.startswith("#"):
+        if content.startswith("#") or content.startswith("---"):
             return content
     # No valid skill_md block found — do NOT fallback to raw evaluation text
     return ""

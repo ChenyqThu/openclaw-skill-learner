@@ -24,7 +24,12 @@ import os from "node:os";
 import http from "node:http";
 
 // ─── Configuration ───────────────────────────────────────────────────────────
-const TOOL_CALL_THRESHOLD = 8;
+// Phase A.6: raised 8 → 15 to cut spam-triggered evaluations while we wait on
+// Phase B (agent-nominated learning). The ≥15 cutoff alone still misses real
+// nominations for shorter novel sessions, but Phase A's downstream validators
+// drop the resulting noise. After Phase B lands, this reverts to a lower bound
+// and the sufficient trigger becomes `nominated OR frictionWeight >= 3`.
+const TOOL_CALL_THRESHOLD = 15;
 const DATA_DIR = path.join(os.homedir(), ".openclaw/workspace/data/skill-learner");
 const MEMORY_MD_PATH = path.join(os.homedir(), ".openclaw/workspace/MEMORY.md");
 const EVALUATE_SERVER_URL = "http://127.0.0.1:8300/evaluate";
@@ -81,6 +86,10 @@ function getOrCreateRun(runId) {
       errorsByTool: {},          // toolName → consecutive error count
       lastSkillReadIndex: -1,    // index of last SKILL.md read
       lastSkillReadName: null,   // name of last skill read
+      // Phase B.2: agent self-nomination
+      nominated: false,          // true if agent called skill_learner_nominate
+      nominationPayload: null,   // full payload from the tool call (topic/pain_point/etc)
+      nominationCount: 0,        // hard cap 3 per run
     });
   }
   return runStats.get(runId);
@@ -408,6 +417,42 @@ export default definePluginEntry({
           console.log(`[skill-learner] 📖 Skill loaded: ${skillName}`);
         }
       }
+
+      // ── Phase B.2: detect agent self-nomination ───────────────────────────
+      // Two routes:
+      //   (1) First-class tool: `skill_learner_nominate` (B.1 — needs OpenClaw support).
+      //   (2) Polyfill: agent writes a file directly to `data/skill-learner/nominations/`
+      //       via `write` / `exec` — unblocks Phase B while B.1 ships.
+      if (event.toolName === "skill_learner_nominate") {
+        const payload = event.params || {};
+        // Hard cap: 3 nominations per run (defense against noisy agents)
+        if (run.nominationCount >= 3) {
+          console.log(`[skill-learner] ⚠️ Nomination rejected: cap reached (3/run) for ${runId}`);
+        } else {
+          run.nominated = true;
+          run.nominationPayload = payload;
+          run.nominationCount += 1;
+          console.log(`[skill-learner] 🎯 Agent self-nominated: ${payload.topic || "(untitled)"}`);
+        }
+      } else if (
+        (event.toolName === "write" || event.toolName === "write_tool" ||
+         event.toolName === "Write_tool" || event.toolName === "edit" ||
+         event.toolName === "exec") &&
+        typeof event.params?.path === "string" &&
+        event.params.path.includes("/data/skill-learner/nominations/") &&
+        event.params.path.endsWith(".json")
+      ) {
+        // Polyfill detection — can't read the file contents here (params is post-tool output),
+        // so just mark the run as nominated; the server will pick up the file from disk.
+        run.nominated = true;
+        run.nominationCount += 1;
+        run.nominationPayload = run.nominationPayload || {
+          topic: "(polyfill: written via file)",
+          _polyfill: true,
+          _filePath: event.params.path,
+        };
+        console.log(`[skill-learner] 🎯 Nomination polyfill detected: ${event.params.path}`);
+      }
     });
 
     // ── Hook 2: agent_end — extract transcript + HTTP fire-and-forget ─────────
@@ -503,6 +548,10 @@ export default definePluginEntry({
         assistantTexts: summary?.assistantTexts || [],
         lastInboundMessageId: summary?.lastInboundMessageId || null,
         timestamp: new Date().toISOString(),
+        // Phase C: best-effort forward of session JSONL path so the evaluator can
+        // optionally read the full transcript. When OpenClaw exposes it in agent_end
+        // (C.1 roadmap), this lights up automatically; until then it's usually null.
+        sessionFile: (ctx && (ctx.sessionFile || ctx.session_file)) || event?.sessionFile || null,
         // Track 1: friction signals for skill evolution
         frictionSignals: friction.signals,
         frictionWeight: friction.totalWeight,
@@ -510,6 +559,9 @@ export default definePluginEntry({
         triggerEvolution,
         // Track 2: correction signals for user modeling
         correctionSignals,
+        // Phase B: agent self-nomination (B.2)
+        nominated: !!run.nominated,
+        nominationPayload: run.nominationPayload || null,
       };
 
       // Mark so session_end skips re-queuing

@@ -80,6 +80,54 @@ gemini_call_times = []  # timestamps of recent Gemini calls
 _notification_threads = []
 _notification_lock = threading.Lock()
 
+# ─── Phase A.2 card-send gates ───────────────────────────────────────────────
+def _coerce_quality_int(val, default: int = 0) -> int:
+    """Coerce quality_score int/float/str → int, robust to Gemini's stringified outputs."""
+    if val is None or isinstance(val, bool):
+        return default
+    if isinstance(val, (int, float)):
+        return int(val)
+    if isinstance(val, str):
+        s = val.strip().strip('"').strip("'")
+        if not s:
+            return default
+        try:
+            return int(float(s))
+        except ValueError:
+            return default
+    return default
+
+
+def _validate_eval_card_ready(skill_name: str) -> bool:
+    """Reload {skill}/.eval.json and verify it has enough substance for a card.
+
+    Belt + suspenders to A.1: even if .eval.json somehow landed with empty
+    fields (dev/test, future refactor), refuse to send a card for it.
+    """
+    eval_path = Path.home() / ".openclaw/workspace/skills/auto-learned" / skill_name / ".eval.json"
+    if not eval_path.exists():
+        # update_proposed flow writes to a different layout; defer to caller
+        return True
+    try:
+        data = json.loads(eval_path.read_text())
+    except Exception:
+        return False
+    problem = (data.get("problem_context") or "").strip()
+    approach = (data.get("recommended_approach") or "").strip()
+    when_to_use = data.get("when_to_use") or []
+    key_patterns = data.get("key_patterns") or []
+    if not isinstance(when_to_use, list):
+        when_to_use = []
+    if not isinstance(key_patterns, list):
+        key_patterns = []
+    return (
+        len(problem) >= 20
+        and len(approach) >= 30
+        and sum(1 for x in when_to_use if isinstance(x, str) and x.strip()) >= 2
+        and sum(1 for x in key_patterns if isinstance(x, str) and x.strip()) >= 1
+    )
+
+
 # ─── Import evaluator ─────────────────────────────────────────────────────────
 _evaluator_imported = False
 _process_queue = None
@@ -136,6 +184,11 @@ def write_queue_file(body: dict) -> str:
         "agentId": body.get("agentId", "jarvis"),
         "sessionKey": body.get("sessionKey", ""),
         "sessionId": body.get("sessionId", ""),
+        # Phase B: propagate nomination & friction signals to the evaluator
+        "nominated": bool(body.get("nominated")),
+        "nominationPayload": body.get("nominationPayload") or None,
+        "frictionWeight": body.get("frictionWeight", 0),
+        "frictionSignals": body.get("frictionSignals", []),
         "status": "pending",
         "source": "evaluate-server",
     }
@@ -342,7 +395,7 @@ def send_feishu_notification(skill_name: str, action: str, tool_count: int,
     ]
     try:
         result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=20
+            cmd, capture_output=True, text=True, timeout=60
         )
         if result.returncode == 0:
             log.info(f"Feishu card sent for skill: {skill_name} ({action_label})")
@@ -375,12 +428,48 @@ def _send_feishu_plain_fallback(skill_name: str, action_label: str, tool_count: 
         log.warning(f"Fallback notification failed: {e}")
 
 # ─── Core Evaluate Handler ─────────────────────────────────────────────────────
+# Phase B.3: gate config — evaluate only when the agent nominated the session
+# OR friction passed the tracked threshold. Override via env var for emergency.
+FRICTION_FALLBACK_MIN = 3
+OMC_SKIP_GATE_ENV = "OMC_SKIP_GATE"  # set to "1" to bypass the gate entirely
+
+
+def _should_gate(body: dict) -> tuple[bool, str]:
+    """Phase B.3 gate. Returns (skip?, reason).
+
+    Gate OPEN (process) when ANY of:
+      • body.nominated is True (agent self-nominated — highest trust signal)
+      • body.frictionWeight >= FRICTION_FALLBACK_MIN (implicit friction fallback)
+      • OMC_SKIP_GATE env var is "1" (emergency bypass for debugging)
+
+    Gate CLOSED (skip + return 202) otherwise.
+    """
+    if os.environ.get(OMC_SKIP_GATE_ENV) == "1":
+        return False, "OMC_SKIP_GATE bypass"
+    if body.get("nominated"):
+        return False, "nominated"
+    fw = body.get("frictionWeight", 0)
+    try:
+        fw = int(fw)
+    except (TypeError, ValueError):
+        fw = 0
+    if fw >= FRICTION_FALLBACK_MIN:
+        return False, f"friction_weight={fw}"
+    return True, f"no nomination, friction={fw} (<{FRICTION_FALLBACK_MIN})"
+
+
 def handle_evaluate(body: dict) -> dict:
     """
     Write queue file, call process_queue(), check for new skills, notify.
-    Returns {"status": "ok"|"throttled"|"error", ...}
+    Returns {"status": "ok"|"throttled"|"error"|"skipped", ...}
     """
     global evaluated_count
+
+    # Phase B.3 gate — skip before any disk/API work
+    skip, why = _should_gate(body)
+    if skip:
+        log.info(f"Gate skip: {why} (runId={body.get('runId', '?')})")
+        return {"status": "skipped", "reason": why}
 
     # Rate limit check
     if not check_rate_limit():
@@ -439,22 +528,20 @@ def handle_evaluate(body: dict) -> dict:
                     if skill_name in skip_list:
                         log.info(f"Skipping notification for blacklisted skill: {skill_name}")
                         continue
-                    # Guard: skip if skill_name is empty/unknown (Gemini returned NO_SKILL but wasn't caught)
+                    # Phase A.2 gate 1 — hard reject machine-named / empty / unknown skills.
+                    # A.1 dropped the auto-{timestamp} fallback in the evaluator, so anything
+                    # landing here with such a name is a bug upstream; refuse to send a card.
                     if not skill_name or skill_name == "unknown" or skill_name.startswith("auto-"):
-                        # Validate the SKILL.md actually has real content
-                        skill_md_path = Path.home() / ".openclaw/workspace/skills/auto-learned" / skill_name / "SKILL.md"
-                        if skill_name.startswith("auto-") and skill_md_path.exists():
-                            skill_md_content = skill_md_path.read_text()
-                            if not skill_md_content.strip().startswith("#"):
-                                log.info(f"Skipping invalid skill (no valid SKILL.md heading): {skill_name}")
-                                continue
-                        elif not skill_md_path.exists():
-                            log.info(f"Skipping skill with missing SKILL.md: {skill_name}")
-                            continue
-                    # Quality-gate: only notify for quality >= 40 (low quality stored silently)
-                    quality_score = item.get("qualityScore", 0)
-                    if quality_score > 0 and quality_score < 40:
-                        log.info(f"Quality too low ({quality_score}/100), silent store: {skill_name}")
+                        log.info(f"Skipping card: invalid skill_name={skill_name!r}")
+                        continue
+                    # Phase A.2 gate 2 — quality gate, coerce + strict ≥40 (drop the '> 0' half-bug)
+                    quality_score = _coerce_quality_int(item.get("qualityScore"))
+                    if quality_score < 40:
+                        log.info(f"Skipping card: quality_score={quality_score} < 40 for {skill_name}")
+                        continue
+                    # Phase A.2 gate 3 — structural .eval.json validation (belt + suspenders)
+                    if not _validate_eval_card_ready(skill_name):
+                        log.info(f"Skipping card: .eval.json failed structural validation for {skill_name}")
                         continue
                     tool_count = item.get("toolCount", body.get("toolCount", 0))
                     agent_id = body.get("agentId", "jarvis")
@@ -693,7 +780,7 @@ def send_evolution_report(skill_name: str, result, friction_signals: list, error
         "--card", card_json,
     ]
     try:
-        result_cmd = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+        result_cmd = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
         if result_cmd.returncode == 0:
             log.info(f"Evolution report card sent for: {skill_name}")
         else:
@@ -783,7 +870,7 @@ def send_modeling_report(proposals: list):
         "--card", card_json,
     ]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
         if result.returncode == 0:
             log.info(f"Modeling report card sent ({len(pending)} proposals)")
         else:

@@ -99,6 +99,198 @@ def _extract_name_from_result(result: str) -> str | None:
     return None
 
 
+# ─── Phase C: Rich session transcript loader ─────────────────────────────────
+def load_full_session_transcript(
+    session_file: str | None,
+    max_chars: int = 30000,
+    priority_turns: list | None = None,
+) -> list[dict]:
+    """Parse a session JSONL and return a structured, budget-aware turn list.
+
+    Each returned dict has:
+      {turn: int, role: str, content: str, tool_name: str|None,
+       tool_params: dict|None, error: str|None, _truncated: bool}
+
+    The plugin currently lacks reliable access to the session JSONL path in
+    `agent_end` (Phase C.1 will fix that). When `session_file` is None/missing,
+    this returns an empty list — callers must fall back to the truncated
+    `userMessages`/`assistantTexts` summary in the request.
+
+    Budget rules:
+      1. If `priority_turns` supplied, those turns are loaded first.
+      2. Remaining budget is filled in forward order.
+      3. Individual content entries >2000 chars are truncated with a _truncated flag.
+      4. When the char budget is exhausted, later turns are dropped.
+    """
+    if not session_file:
+        return []
+    try:
+        p = Path(session_file)
+        if not p.exists():
+            return []
+    except Exception:
+        return []
+
+    raw_turns: list[dict] = []
+    try:
+        for i, line in enumerate(p.read_text().splitlines()):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except Exception:
+                continue
+            # Normalize shape — different OpenClaw versions use different keys
+            role = obj.get("role") or obj.get("type") or "unknown"
+            content = obj.get("content") or obj.get("text") or ""
+            if isinstance(content, list):
+                # Multi-block content — flatten text parts
+                parts = []
+                for b in content:
+                    if isinstance(b, dict):
+                        if b.get("type") in ("text", "content"):
+                            parts.append(str(b.get("text") or ""))
+                        elif b.get("type") in ("toolCall", "tool_use"):
+                            parts.append(f"[tool: {b.get('name') or b.get('tool_name')}]")
+                    elif isinstance(b, str):
+                        parts.append(b)
+                content = "\n".join(parts)
+            content = str(content or "")
+            truncated = False
+            if len(content) > 2000:
+                content = content[:2000]
+                truncated = True
+            raw_turns.append({
+                "turn": i + 1,
+                "role": role,
+                "content": content,
+                "tool_name": obj.get("tool_name") or obj.get("toolName") or None,
+                "tool_params": obj.get("tool_params") or obj.get("params") or None,
+                "error": obj.get("error") or None,
+                "_truncated": truncated,
+            })
+    except Exception:
+        return []
+
+    # Budget filling
+    priority_turns = priority_turns or []
+    priority_set = {int(t) for t in priority_turns if isinstance(t, (int, float, str)) and str(t).strip().lstrip("-").isdigit()}
+
+    picked: list[dict] = []
+    used = 0
+
+    def _fits(turn: dict) -> bool:
+        nonlocal used
+        cost = len(turn.get("content") or "") + 128  # 128-char overhead for framing
+        return used + cost <= max_chars
+
+    # Pass 1 — priority turns
+    for t in raw_turns:
+        if t["turn"] in priority_set and _fits(t):
+            picked.append(t)
+            used += len(t["content"]) + 128
+
+    # Pass 2 — fill forward with non-priority turns
+    seen = {t["turn"] for t in picked}
+    for t in raw_turns:
+        if t["turn"] in seen:
+            continue
+        if _fits(t):
+            picked.append(t)
+            used += len(t["content"]) + 128
+        else:
+            break
+
+    picked.sort(key=lambda x: x["turn"])
+    return picked
+
+
+def _coerce_int(val, default: int = 0) -> int:
+    """Coerce string/int/float to int; return default on failure.
+
+    Gemini sometimes returns quality_score.total as '"80"' (string) due to prompt quoting.
+    Post-A.6 the prompt drops quotes, but we coerce defensively.
+    """
+    if val is None:
+        return default
+    if isinstance(val, bool):
+        return default
+    if isinstance(val, (int, float)):
+        return int(val)
+    if isinstance(val, str):
+        s = val.strip().strip('"').strip("'")
+        if not s:
+            return default
+        try:
+            return int(float(s))
+        except ValueError:
+            return default
+    return default
+
+
+CANONICAL_SECTION_HEADERS = (
+    "## 适用场景",
+    "## 不适用场景",
+    "## 操作步骤",
+    "## 示例",
+    "## 已知雷区",
+    "## 验证方式",
+)
+
+
+def _validate_skill_candidate(eval_data: dict, skill_content: str, skill_name: str) -> tuple[bool, list[str]]:
+    """Strict validator for new-skill candidates.
+
+    Returns (is_valid, errors). A candidate must satisfy ALL:
+      1. skill_name is non-empty, non-placeholder
+      2. skill_content has YAML frontmatter (--- open + --- close on its own line)
+      3. skill_content contains ≥3 of the 6 canonical section headers
+      4. eval_data.problem_context length ≥ 20
+      5. eval_data.recommended_approach length ≥ 30
+      6. eval_data.quality_score.total ≥ 40 (after int coercion)
+    """
+    errors: list[str] = []
+
+    # (1) Name
+    if not skill_name or skill_name.startswith("auto-") or skill_name == "unknown":
+        errors.append(f"invalid_skill_name: {skill_name!r}")
+
+    # (2) Frontmatter presence
+    if not skill_content or not isinstance(skill_content, str):
+        errors.append("empty_skill_content")
+    else:
+        content = skill_content.lstrip()
+        if not content.startswith("---"):
+            errors.append("missing_frontmatter_open")
+        elif "\n---\n" not in content and not content.rstrip().endswith("---"):
+            errors.append("missing_frontmatter_close")
+
+    # (3) Canonical sections (≥3 of 6)
+    if skill_content:
+        hit = sum(1 for h in CANONICAL_SECTION_HEADERS if h in skill_content)
+        if hit < 3:
+            errors.append(f"insufficient_sections: {hit}/6 (need ≥3)")
+
+    # (4) problem_context
+    pc = (eval_data.get("problem_context") or "").strip()
+    if len(pc) < 20:
+        errors.append(f"problem_context_too_short: {len(pc)} chars (need ≥20)")
+
+    # (5) recommended_approach
+    ra = (eval_data.get("recommended_approach") or "").strip()
+    if len(ra) < 30:
+        errors.append(f"recommended_approach_too_short: {len(ra)} chars (need ≥30)")
+
+    # (6) quality_score.total ≥ 40
+    q = eval_data.get("quality_score")
+    quality_total = _coerce_int(q.get("total") if isinstance(q, dict) else 0, 0)
+    if quality_total < 40:
+        errors.append(f"quality_total_too_low: {quality_total}/100 (need ≥40)")
+
+    return (len(errors) == 0, errors)
+
+
 
 # call_gemini is now imported from gemini_client
 
@@ -627,23 +819,45 @@ def process_queue():
                     req_file.write_text(json.dumps(request, indent=2))
                     continue
 
-                # Parse structured eval_json block
+                # Parse structured eval_json block (no auto-{timestamp} fallback — Phase A.1)
                 eval_data = _extract_eval_json(result)
                 skill_name = (eval_data.get("skill_name")
                               or _extract_name_from_result(result)
-                              or f"auto-{req_file.stem[:12]}")
-
-                # Extract skill_md block
+                              or "")
                 skill_content = _extract_skill_md(result)
 
-                # Guard: skip if no valid SKILL.md content was extracted
-                if not skill_content or not skill_content.startswith("#"):
-                    print(f"  ⏭️ No valid SKILL.md block extracted (name would be: {skill_name}), skipping")
-                    request["status"] = "no_skill_md"
+                # Strict validation gate — no writes to disk / pending-review if any check fails
+                is_valid, validation_errors = _validate_skill_candidate(
+                    eval_data, skill_content, skill_name
+                )
+                if not is_valid:
+                    print(f"  ⏭️ Skill candidate rejected: {', '.join(validation_errors)}")
+                    # Map the first error to a discriminating status for log mining
+                    first_err = validation_errors[0]
+                    if first_err.startswith("invalid_skill_name"):
+                        request["status"] = "no_skill_name"
+                    elif first_err.startswith("empty_skill_content") or first_err.startswith("missing_frontmatter"):
+                        request["status"] = "no_skill_md"
+                    elif first_err.startswith("insufficient_sections"):
+                        request["status"] = "incomplete_skill_md"
+                    elif first_err.startswith("problem_context") or first_err.startswith("recommended_approach"):
+                        request["status"] = "shallow_eval_json"
+                    elif first_err.startswith("quality_total"):
+                        request["status"] = "low_quality"
+                    else:
+                        request["status"] = "invalid_skill"
+                    request["validationErrors"] = validation_errors
                     req_file.write_text(json.dumps(request, indent=2))
                     continue
 
-                # Write
+                # Validation passed — candidate has structurally valid frontmatter, sections,
+                # non-trivial problem_context / recommended_approach, and quality_total ≥ 40.
+                quality_total = _coerce_int(
+                    eval_data.get("quality_score", {}).get("total")
+                    if isinstance(eval_data.get("quality_score"), dict) else 0,
+                    0,
+                )
+
                 skill_dir = SKILLS_DIR / skill_name
                 skill_dir.mkdir(parents=True, exist_ok=True)
                 (skill_dir / "SKILL.md").write_text(skill_content)
@@ -654,11 +868,6 @@ def process_queue():
                     "toolNames": request.get("toolNames", []),
                     "status": "pending_review",
                 }, indent=2))
-                # Extract quality_score if present
-                quality = eval_data.get("quality_score", {})
-                quality_total = quality.get("total", 0) if isinstance(quality, dict) else 0
-
-                # Write .eval.json for richer notification card
                 (skill_dir / ".eval.json").write_text(json.dumps({
                     "action": "create",
                     "generatedAt": datetime.now().isoformat(),
@@ -669,17 +878,7 @@ def process_queue():
                     **eval_data,
                 }, indent=2, ensure_ascii=False))
 
-                # Quality-gate: low-score skills stored silently
-                if quality_total > 0 and quality_total < 40:
-                    print(f"  ⚠️ Low quality ({quality_total}/100), stored silently: {skill_name}")
-                    request["status"] = "low_quality"
-                    request["skillName"] = skill_name
-                    request["qualityScore"] = quality_total
-                    req_file.write_text(json.dumps(request, indent=2))
-                    continue
-
-                quality_label = f" (quality: {quality_total}/100)" if quality_total > 0 else ""
-                print(f"  \u2705 New skill draft: {skill_name}{quality_label}")
+                print(f"  ✅ New skill draft: {skill_name} (quality: {quality_total}/100)")
                 skills_created.append({
                     "skillName": skill_name,
                     "toolCount": request["toolCount"],

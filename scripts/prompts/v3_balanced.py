@@ -5,7 +5,53 @@ Changes from v2:
   2. Add stronger precision guard: routine cron without DEVIATION is NOT a skill
   3. Add "deviation test": session must show agent DEVIATING from expected path
   4. Strengthen red flags with specific false positive patterns from v2 evaluation
+
+Phase A updates:
+  A.4: inject rejection-context.json (recent skipped/discussed skills) as negative examples
+  A.5: relax cron red flag — multi-hop orchestration / error recovery can qualify
+  A.6: drop quoting on quality_score fields so Gemini emits integers (weights corrected)
 """
+
+import json
+from pathlib import Path
+
+REJECTION_CONTEXT_FILE = Path.home() / ".openclaw/workspace/data/skill-learner/rejection-context.json"
+_RECENT_REJECTIONS_CAP = 10
+
+
+def _load_recent_rejections_note() -> str:
+    """Read the last N entries from rejection-context.json and format as negative examples.
+
+    Returns empty string if no rejections recorded yet or file missing.
+    """
+    if not REJECTION_CONTEXT_FILE.exists():
+        return ""
+    try:
+        entries = json.loads(REJECTION_CONTEXT_FILE.read_text())
+        if not isinstance(entries, list):
+            return ""
+    except Exception:
+        return ""
+    recent = entries[-_RECENT_REJECTIONS_CAP:]
+    if not recent:
+        return ""
+    lines = []
+    for r in recent:
+        if not isinstance(r, dict):
+            continue
+        neg = r.get("promptNegativeExample") or ""
+        if not neg:
+            continue
+        lines.append(f"- {neg}")
+    if not lines:
+        return ""
+    return (
+        "\n━━━ 用户已拒绝的历史提议 (不要重复) ━━━\n"
+        + "\n".join(lines)
+        + "\n如果本次 session 的模式在抽象层与上述任一被拒提议相同，应输出 NO_SKILL。\n"
+        + "判断的是「抽象模式」，不是「表面话题」——"
+        + "即使表面话题不同，只要底层做法重合，也属于重复提议。\n"
+    )
 
 
 def build_new_skill_prompt(request: dict, existing_summary: str) -> str:
@@ -28,6 +74,44 @@ def build_new_skill_prompt(request: dict, existing_summary: str) -> str:
             + " anything new, output NO_SKILL. Only create a new skill if the pattern is"
             + " genuinely DIFFERENT from these existing skills.\n"
         )
+
+    # Phase A.4: inject recent user rejections as negative examples
+    rejections_note = _load_recent_rejections_note()
+
+    # Phase B.4: if agent self-nominated, lift it as a high-trust signal block.
+    nomination_note = ""
+    if request.get("nominated") and isinstance(request.get("nominationPayload"), dict):
+        np = request["nominationPayload"]
+        topic = (np.get("topic") or "").strip()
+        pain = (np.get("pain_point") or "").strip()
+        reusable = (np.get("reusable_pattern") or "").strip()
+        conf = np.get("confidence") or "medium"
+        evidence = np.get("evidence_turns") or []
+        if isinstance(evidence, list):
+            evidence_str = ", ".join(f"turn {t}" for t in evidence[:8])
+        else:
+            evidence_str = str(evidence)
+        # Only emit the block if the nomination has at least topic — else treat as polyfill-only
+        if topic or reusable or pain:
+            nomination_note = (
+                "\n━━━ AGENT SELF-NOMINATION (高信任信号) ━━━\n"
+                f"Jarvis 在本次 session 结束前主动调用了 skill_learner_nominate。\n"
+                f"  Topic: {topic or '(未填)'}\n"
+                f"  Pain point: {pain or '(未填)'}\n"
+                f"  Reusable pattern: {reusable or '(未填)'}\n"
+                f"  Confidence: {conf}\n"
+                f"  Evidence turns: {evidence_str or '(未标注)'}\n"
+                "\n权重说明：Agent 自证发现了可沉淀模式,这是比外部观察更可靠的信号。\n"
+                "  • 若 session 内容能支持 Jarvis 的自述 → 倾向 QUALIFY,即便 deviation 不显眼。\n"
+                "  • 若 session 与 nomination 完全不匹配（Jarvis 说发现了 X,transcript 里看不到 X）→ 仍可 NO_SKILL。\n"
+                "  • confidence=low 的 nomination 需要更强 session 佐证才 qualify。\n"
+            )
+        elif np.get("_polyfill"):
+            nomination_note = (
+                "\n━━━ AGENT NOMINATION (polyfill,payload 未捕获) ━━━\n"
+                "Jarvis 向 nominations/ 目录写了文件但 plugin 未能直接读取 payload。\n"
+                "按常规标准评估,但把「agent 认为有料」作为弱加分。\n"
+            )
 
     prompt = (
         "You are evaluating an AI agent session to decide if a reusable Skill should be created.\n"
@@ -57,6 +141,8 @@ def build_new_skill_prompt(request: dict, existing_summary: str) -> str:
         "\n"
         "EXISTING SKILLS (do NOT create a skill that duplicates these):\n"
         f"{existing_summary}\n"
+        f"{rejections_note}"
+        f"{nomination_note}"
         "\n"
         "━━━ WHAT IS AN OPENCLAW SKILL ━━━\n"
         "A Skill is a reusable *agent behavioral pattern* — a guide for HOW Jarvis should approach\n"
@@ -106,8 +192,13 @@ def build_new_skill_prompt(request: dict, existing_summary: str) -> str:
         "• The session merely follows a pre-written script without any deviation or discovery\n"
         "• The approach is obvious (standard debugging, simple file edit, routine API call)\n"
         "• An existing skill above already covers this exact pattern\n"
-        "• Cron/scheduled task that completed successfully by following its instructions step-by-step\n"
-        "  (even if it uses many tools — using many tools is NOT the same as discovering a pattern)\n"
+        "• Cron/scheduled task that ran as a LINEAR, SINGLE-BRANCH tool chain:\n"
+        "  no sub-agent spawns, no fallback branches, no retries, no source failures that\n"
+        "  required recovery. A cron that simply executed its playbook step-by-step and succeeded\n"
+        "  is NOT a skill — using many tools ≠ discovering a pattern.\n"
+        "  NOTE: cron tasks that orchestrate multi-hop parallel work, recover from partial source\n"
+        "  failures, combine tools in non-obvious ways, OR made a course-correction mid-run\n"
+        "  CAN qualify. Evaluate on DEVIATION / RECOVERY, not on whether the cron finished.\n"
         "• Session describes a standard data read → format → output pipeline with no surprises\n"
         "• Agent merely synced data between two systems without encountering obstacles\n"
         "\n"
@@ -167,12 +258,12 @@ def build_new_skill_prompt(request: dict, existing_summary: str) -> str:
         '  "key_patterns": ["<具体工具组合或参数1>", "<模式2>"],\n'
         '  "pitfalls": ["<雷区1>", "<雷区2>"],\n'
         '  "quality_score": {\n'
-        '    "reusability": "<1-10>",\n'
-        '    "insight_depth": "<1-10>",\n'
-        '    "specificity": "<1-10>",\n'
-        '    "pitfall_coverage": "<1-10>",\n'
-        '    "completeness": "<1-10>",\n'
-        '    "total": "<0-100, 五项加权总分: reusability×25 + insight_depth×25 + specificity×20 + pitfall_coverage×15 + completeness×15>"\n'
+        '    "reusability": <1-10 整数>,\n'
+        '    "insight_depth": <1-10 整数>,\n'
+        '    "specificity": <1-10 整数>,\n'
+        '    "pitfall_coverage": <1-10 整数>,\n'
+        '    "completeness": <1-10 整数>,\n'
+        '    "total": <0-100 整数, 五项加权总分: reusability×2.5 + insight_depth×2.5 + specificity×2.0 + pitfall_coverage×1.5 + completeness×1.5>\n'
         "  }\n"
         "}\n"
         "```\n"
@@ -306,12 +397,12 @@ def build_update_skill_prompt(request: dict, skill_name: str, skill_content: str
         '  "new_pitfalls": ["<新雷区1>", "<新雷区2>"],\n'
         '  "key_changes": ["<修改什么及原因>"],\n'
         '  "quality_score": {\n'
-        '    "reusability": "<1-10>",\n'
-        '    "insight_depth": "<1-10>",\n'
-        '    "specificity": "<1-10>",\n'
-        '    "pitfall_coverage": "<1-10>",\n'
-        '    "completeness": "<1-10>",\n'
-        '    "total": "<0-100>"\n'
+        '    "reusability": <1-10 整数>,\n'
+        '    "insight_depth": <1-10 整数>,\n'
+        '    "specificity": <1-10 整数>,\n'
+        '    "pitfall_coverage": <1-10 整数>,\n'
+        '    "completeness": <1-10 整数>,\n'
+        '    "total": <0-100 整数, 五项加权总分: reusability×2.5 + insight_depth×2.5 + specificity×2.0 + pitfall_coverage×1.5 + completeness×1.5>\n'
         "  }\n"
         "}\n"
         "```\n"
