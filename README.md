@@ -487,8 +487,8 @@ Plugin SDK already provides everything needed; no OpenClaw upstream PR required:
 - [x] **C.1.c `sub_agent_spawned/ended` hooks** — plugin builds parent↔child runId map; child summaries forward to parent `agent_end` payload
 
 ### Still in flight (non-SDK reasons)
-- [ ] **C.1.a `skill_considered_rejected`** — agent's internal decision, platform doesn't emit. Two paths: AGENTS.md protocol + agent self-log, OR new `skill_consider_note` tool in plugin
-- [ ] **D headless Jarvis runner** — could try plugin SDK `api.registerAgentHarness`, or shell out to `claude-code` as polyfill. Phase D skeleton has `HeadlessJarvisClient` waiting
+- [ ] **C.1.a `skill_considered_rejected`** — task handed to Jarvis (OpenClaw side), AGENTS.md §六 protocol + weekly-review `[考虑未用]` backfill. See `docs/PHASE_4_1_C1A_AGENT_PROTOCOL_TASK.md`. Data density review after 1 week → decide whether to escalate to a plugin tool
+- [x] **D headless Jarvis runner** — implemented via `claude` CLI shell-out (`--bare --print --output-format stream-json --append-system-prompt`). Positive / negative discrimination verified end-to-end (1.7s/run, ~$0.02). Native `api.registerAgentHarness` path remains as future upgrade
 
 ### Open (no OpenClaw dep)
 - [ ] **Card action handler**: `card_action` hook so skip-with-reason writes directly

@@ -15,8 +15,8 @@
 | **B.1 first-class tool** | P0 需 PR | ✅ **DONE via plugin SDK** | `api.registerTool()` + typebox schema → 30 行 plugin 代码搞定。agent 可直接调用 `skill_learner_nominate`，payload 带 `_firstClass: true` |
 | **C.1.b params 全透传** | P2 需 PR | ✅ **DONE via plugin SDK** | `after_tool_call.event.params` 一直是 `Record<string, unknown>` 全透传，只是 plugin 以前自己没读。新增 `sanitizeParams` 脱敏 + `appendToolTrace` 环形缓冲 (cap 40) |
 | **C.1.c sub_agent hooks** | P1 需 PR | ✅ **DONE via plugin SDK** | `subagent_spawned` / `subagent_ended` 两个 hook 都在。plugin 建立 parent↔child runId 映射，子 run 的 `agent_end` 把 summary forward 到父 run 的 HTTP payload |
-| C.1.a `skill_considered_rejected` | P3 需 PR | 🟡 仍需 agent 协作 | 本质是 agent 内部决策，平台不 emit。两条路径：AGENTS.md 协议 + agent 主动记录 / plugin 新增 `skill_consider_note` 工具 |
-| D Headless Jarvis CLI | P4 optional | 🟡 未探 `registerAgentHarness` | plugin SDK 有 `api.registerAgentHarness`（`types.d.ts:1628`）理论可从 plugin 侧注册 ephemeral harness。Phase D 骨架已预留 polyfill=shell out 到 `claude-code` |
+| C.1.a `skill_considered_rejected` | P3 需 PR | 🟢 **任务已下发 Jarvis** | AGENTS.md 协议路径,周回顾补标 `[考虑未用]` 标记。详见 [PHASE_4_1_C1A_AGENT_PROTOCOL_TASK.md](PHASE_4_1_C1A_AGENT_PROTOCOL_TASK.md) |
+| D Headless Jarvis CLI | P4 optional | ✅ **DONE via claude-code shell-out** | `HeadlessJarvisClient` 用 `claude --bare --print --output-format stream-json --append-system-prompt` 实现,端到端测过 (positive/negative 区分正常,1.7s/run,~$0.02)。`api.registerAgentHarness` 原生路径留作后续升级 |
 
 以下章节保留当时的规格原文作为历史记录 + 实现参考。已落地的项在章节标题加了 `[DONE]` 前缀指向 plugin 实现。
 
@@ -174,7 +174,18 @@ sub_agent_complete({
 
 ---
 
-## D — Headless Jarvis 模式（可选）
+## D — Headless Jarvis 模式 `[DONE via claude-code shell-out]`
+
+**实际**：Phase D 的 `HeadlessJarvisClient` 已经用 `claude` CLI shell-out 实现（`scripts/replay_gate.py`）。命令形态:
+`claude --bare --print --output-format stream-json --verbose --append-system-prompt <SKILL.md block> --disallowedTools Bash,Write,Edit,WebFetch,WebSearch --max-budget-usd 0.05 <prompt>`
+
+端到端测过(2026-04-17):匹配 prompt → `skill_loaded: True`;不匹配 prompt → `skill_loaded: False`;1.7s/run,$0.02 平均成本。stream-json 解析器抽取 `tool_use` 事件构成 trajectory,通过 `Loading skill: <name>` 文本标记确认加载。
+
+原生 `api.registerAgentHarness` 路径留作后续升级(类型定义在 plugin-sdk/src/plugins/types.d.ts:1628),当前 shell-out 已足以支撑 Phase D 验证场景。
+
+---
+
+**原规格**:
 
 **优先级**：P2（Phase D 回放校验 gate 的基础）
 
