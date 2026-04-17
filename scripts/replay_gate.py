@@ -204,33 +204,179 @@ def extract_expected_tools_from_skill_md(skill_md: str) -> list[str]:
     return found
 
 
-# ─── Headless Jarvis runner (STUB — OpenClaw coop needed) ────────────────────
+# ─── Headless runner — shell out to claude-code CLI ──────────────────────────
+SKILL_LOAD_MARKER_PREFIX = "Loading skill: "
+DEFAULT_MAX_BUDGET_USD = 0.05
+DEFAULT_DISALLOWED_TOOLS = "Bash,Write,Edit,WebFetch,WebSearch"
+
+
 class HeadlessJarvisClient:
-    """Ephemeral Jarvis runner. Currently a stub; see docs/OPENCLAW_COOPERATION_PHASE2.md §D.
+    """Ephemeral replay runner using the `claude` CLI (Phase D, Path B).
 
-    When OpenClaw ships headless mode, replace this with:
+    Rationale: the dedicated OpenClaw headless mode would be the cleanest answer,
+    but `api.registerAgentHarness` is a 1-2 day integration effort and Phase D's
+    value hasn't been proven yet. claude-code's `--bare --print --output-format
+    stream-json` mode gives us a close-enough proxy:
 
-        class HeadlessJarvisClient:
-            def run(self, prompt: str, skills_dir: Path, timeout: int = 60):
-                result = subprocess.run(
-                    ["openclaw", "jarvis-headless",
-                     "--skills-dir", str(skills_dir),
-                     "--prompt", prompt, "--timeout", str(timeout),
-                     "--output-jsonl", "/tmp/replay.jsonl"],
-                    capture_output=True, timeout=timeout + 10,
-                )
-                ...parse JSONL for tool trajectory...
+      • --bare           skips hooks / plugin sync / memory / CLAUDE.md discovery
+                         (no cross-contamination with the real environment)
+      • --append-system-prompt <prompt>  injects the candidate SKILL.md so the
+                                          model can decide whether to invoke it
+      • --disallowedTools Bash,Write,Edit,WebFetch,WebSearch  no side effects
+      • --max-budget-usd 0.05  hard cost cap per replay run
+      • --output-format stream-json + --verbose  structured tool_use + text events
+
+    This is a *signal proxy* — claude-code's loading heuristics approximate (but
+    do not equal) Jarvis's. False positives / negatives will happen; the gate
+    threshold (≥0.5 skill_loaded_rate, ≥0.6 trajectory overlap) should be tuned
+    empirically from the first weeks of data.
     """
 
-    def __init__(self, skills_dir: Path):
-        self.skills_dir = skills_dir
+    def __init__(self, skills_dir: Path | None = None):
+        self.skills_dir = skills_dir  # retained for API compatibility; not used here
 
-    def run(self, prompt: str, timeout: int = 60) -> ReplayRun:
-        raise NotImplementedError(
-            "HeadlessJarvisClient.run() requires OpenClaw headless mode "
-            "(see docs/OPENCLAW_COOPERATION_PHASE2.md §D). "
-            "Use dry_run=True or plug in a claude-code-based fallback."
+    @staticmethod
+    def cli_available() -> bool:
+        """True if the `claude` CLI is on PATH and supports stream-json."""
+        import shutil
+        return shutil.which("claude") is not None
+
+    def run(
+        self,
+        prompt: str,
+        skill_md: str,
+        skill_name: str,
+        *,
+        timeout: int = 90,
+        max_budget_usd: float = DEFAULT_MAX_BUDGET_USD,
+        disallowed_tools: str = DEFAULT_DISALLOWED_TOOLS,
+    ) -> ReplayRun:
+        """Run one test prompt against a candidate skill. Parse stream-json output.
+
+        Returns ReplayRun with skill_loaded / tool_trajectory / overlap_score (0 —
+        caller computes). Errors are captured in ReplayRun.error.
+        """
+        if not self.cli_available():
+            return ReplayRun(
+                prompt=prompt, error="claude CLI not in PATH", skill_loaded=False
+            )
+
+        import subprocess
+        import time
+
+        system_prompt = (
+            f"You have a candidate SKILL available for this task: `{skill_name}`.\n\n"
+            "--- BEGIN SKILL.md ---\n"
+            f"{skill_md}\n"
+            "--- END SKILL.md ---\n\n"
+            f"Rules for this replay test:\n"
+            f"  1. If the user's request matches the skill's `## 适用场景` / `## When to Use`,\n"
+            f"     FIRST emit a single line exactly: `{SKILL_LOAD_MARKER_PREFIX}{skill_name}`\n"
+            "     Then proceed following the `## 操作步骤` / `## Procedure` section.\n"
+            "  2. If the request is clearly unrelated, DO NOT emit the marker; just answer\n"
+            "     briefly without invoking the skill.\n"
+            "  3. This is a replay test — DO NOT perform network calls, file writes, or any\n"
+            "     irreversible action. Read-only exploration is fine.\n"
+            "  4. Keep the response short. Tool choices matter more than prose.\n"
         )
+
+        cmd = [
+            "claude",
+            "--bare",
+            "--print",
+            "--output-format", "stream-json",
+            "--verbose",
+            "--max-budget-usd", str(max_budget_usd),
+            "--disallowedTools", disallowed_tools,
+            "--append-system-prompt", system_prompt,
+            prompt,
+        ]
+
+        t0 = time.time()
+        try:
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=timeout
+            )
+        except subprocess.TimeoutExpired:
+            return ReplayRun(
+                prompt=prompt, error=f"timeout after {timeout}s",
+                duration_ms=int((time.time() - t0) * 1000),
+            )
+        except Exception as e:
+            return ReplayRun(prompt=prompt, error=f"subprocess error: {e}")
+
+        duration_ms = int((time.time() - t0) * 1000)
+
+        if result.returncode != 0:
+            stderr_tail = (result.stderr or "")[-400:]
+            return ReplayRun(
+                prompt=prompt,
+                error=f"exit={result.returncode}: {stderr_tail}",
+                duration_ms=duration_ms,
+            )
+
+        return _parse_stream_json(
+            prompt=prompt,
+            skill_name=skill_name,
+            stdout=result.stdout,
+            duration_ms=duration_ms,
+        )
+
+
+def _parse_stream_json(
+    prompt: str, skill_name: str, stdout: str, duration_ms: int
+) -> ReplayRun:
+    """Walk claude stream-json to extract tool trajectory + skill-load marker.
+
+    Each stdout line is one NDJSON event. Interesting shapes:
+      {type: "assistant", message: {content: [{type: "tool_use", name, input}, ...]}}
+      {type: "assistant", message: {content: [{type: "text", text}]}}
+      {type: "result", total_cost_usd, is_error, terminal_reason}
+    """
+    skill_loaded = False
+    tool_trajectory: list[str] = []
+    error_msg: str | None = None
+    marker = f"{SKILL_LOAD_MARKER_PREFIX}{skill_name}"
+
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except Exception:
+            continue
+
+        etype = event.get("type")
+        if etype == "assistant":
+            msg = event.get("message") or {}
+            content = msg.get("content") or []
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                btype = block.get("type")
+                if btype == "tool_use":
+                    name = block.get("name")
+                    if isinstance(name, str):
+                        tool_trajectory.append(name)
+                elif btype == "text":
+                    text = block.get("text") or ""
+                    if marker in text:
+                        skill_loaded = True
+        elif etype == "result":
+            if event.get("is_error"):
+                error_msg = event.get("result") or event.get("error") or "unknown error"
+
+    return ReplayRun(
+        prompt=prompt,
+        skill_loaded=skill_loaded,
+        tool_trajectory=tool_trajectory,
+        overlap_score=0.0,  # filled in by replay_skill
+        error=error_msg,
+        duration_ms=duration_ms,
+    )
 
 
 # ─── Main replay loop ────────────────────────────────────────────────────────
@@ -293,9 +439,17 @@ def replay_skill(
     expected = extract_expected_tools_from_skill_md(skill_md)
 
     if use_runner and not dry_run:
-        runner = HeadlessJarvisClient(WORKSPACE / "skills")  # will raise until OpenClaw ships
-        for tp in test_prompts:
-            runs.append(runner.run(tp.prompt))
+        runner = HeadlessJarvisClient(WORKSPACE / "skills")
+        if not runner.cli_available():
+            # Automatic degrade — don't silently fail the gate, drop to dry_run
+            print("  [replay_gate] claude CLI not available → falling back to --dry-run")
+            runs = _dry_run_predict(skill_md, test_prompts, expected)
+            dry_run = True
+        else:
+            for tp in test_prompts:
+                rr = runner.run(tp.prompt, skill_md=skill_md, skill_name=skill_name)
+                rr.overlap_score = compute_overlap(expected, rr.tool_trajectory)
+                runs.append(rr)
     else:
         # Dry-run fallback: ask Gemini to predict tool trajectory for each prompt
         runs = _dry_run_predict(skill_md, test_prompts, expected)
