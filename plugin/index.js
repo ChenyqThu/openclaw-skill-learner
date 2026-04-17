@@ -1,5 +1,5 @@
 /**
- * jarvis-skill-learner — OpenClaw Plugin  (Phase 3: Self-Evolution)
+ * jarvis-skill-learner — OpenClaw Plugin  (Phase 4: SDK-Native Integration)
  *
  * Track 0 (Skill Learning):
  *  • Idempotency dedup Sets for after_tool_call / agent_end / session_end
@@ -13,11 +13,20 @@
  *  • Friction data piggybacks on existing HTTP POST (no new network calls)
  *  • frictionWeight >= 4 triggers Darwin evolution loop server-side
  *
+ * Phase 4 — OpenClaw SDK-native integration (2026-04-17):
+ *  • B.1 first-class:  api.registerTool("skill_learner_nominate", ...) — no polyfill needed
+ *  • C.1.b params:     after_tool_call.event.params is already fully passed through;
+ *                      we now capture (with redaction + truncation) for evaluation context
+ *  • C.1.c sub_agent:  subagent_spawned / subagent_ended hooks build parent↔child runId map;
+ *                      child agent_end payload now reaches parent's Skill eval context
+ *  • Polyfill paths preserved for back-compat (write → nominations/*.json still works)
+ *
  * Security: No child_process. HTTP to localhost only. fs allowed.
  * Plugin must remain ESM (import / export default definePluginEntry).
  */
 
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
+import { Type } from "@sinclair/typebox";
 import fs from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
@@ -353,6 +362,172 @@ async function checkMemoryHealth() {
   }
 }
 
+// ─── Phase 4 (C.1.b): tool-call params capture with redaction ────────────────
+// OpenClaw's after_tool_call event.params is already fully passed through — this
+// helper sanitizes + truncates so we can include richer signals in evaluation
+// payloads without leaking secrets or blowing up prompt budgets.
+const REDACT_KEYS = /(password|secret|token|api[_-]?key|auth|private[_-]?key|credential|bearer)/i;
+const MAX_STRING_LEN = 2000;
+const MAX_PARAMS_BYTES = 8000; // hard cap per tool call
+
+function sanitizeParams(params) {
+  if (!params || typeof params !== "object") return null;
+  const out = {};
+  let totalBytes = 0;
+  for (const [k, v] of Object.entries(params)) {
+    if (REDACT_KEYS.test(k)) {
+      out[k] = "[REDACTED]";
+      continue;
+    }
+    let serialized;
+    if (typeof v === "string") {
+      serialized = v.length > MAX_STRING_LEN ? v.slice(0, MAX_STRING_LEN) + `…[+${v.length - MAX_STRING_LEN}]` : v;
+    } else if (v == null || typeof v === "number" || typeof v === "boolean") {
+      serialized = v;
+    } else {
+      try {
+        const s = JSON.stringify(v);
+        serialized = s.length > MAX_STRING_LEN ? s.slice(0, MAX_STRING_LEN) + `…[+${s.length - MAX_STRING_LEN}]` : s;
+      } catch { serialized = "[unserializable]"; }
+    }
+    // Also redact if the serialized value obviously contains a bearer token shape
+    if (typeof serialized === "string" && /Bearer\s+[A-Za-z0-9\-_\.]{20,}/.test(serialized)) {
+      serialized = serialized.replace(/Bearer\s+[A-Za-z0-9\-_\.]{20,}/g, "Bearer [REDACTED]");
+    }
+    out[k] = serialized;
+    totalBytes += JSON.stringify(serialized || "").length + k.length;
+    if (totalBytes > MAX_PARAMS_BYTES) { out.__truncated = true; break; }
+  }
+  return out;
+}
+
+// Per-run tool-call trace with sanitized params (bounded ring buffer).
+const TOOL_TRACE_MAX = 40;
+function appendToolTrace(run, toolName, params, error, durationMs) {
+  if (!run.toolTrace) run.toolTrace = [];
+  if (run.toolTrace.length >= TOOL_TRACE_MAX) run.toolTrace.shift();
+  run.toolTrace.push({
+    name: toolName,
+    params: sanitizeParams(params),
+    error: error ? String(error).slice(0, 200) : null,
+    durationMs: durationMs || 0,
+  });
+}
+
+// ─── Phase 4 (C.1.c): sub-agent parent↔child run registry ───────────────────
+// Keyed by childRunId so agent_end (fired for the child run) can discover its
+// parent run context and forward a compact summary upstream.
+const subagentRegistry = new Map(); // childRunId → { parentRunId, childSessionKey, agentId, spawnedAt }
+const SUBAGENT_REGISTRY_MAX = 64;
+
+function registerSubagentSpawn(childRunId, parentRunId, meta) {
+  if (!childRunId) return;
+  if (subagentRegistry.size >= SUBAGENT_REGISTRY_MAX) {
+    const first = subagentRegistry.keys().next().value;
+    subagentRegistry.delete(first);
+  }
+  subagentRegistry.set(childRunId, { parentRunId, spawnedAt: Date.now(), ...meta });
+}
+
+// Per parent run, accumulate child summaries (produced when the child's agent_end fires).
+const parentSubagentSummaries = new Map(); // parentRunId → [ { childRunId, agentId, toolCount, summary, outcome } ]
+
+function appendSubagentSummary(parentRunId, summary) {
+  if (!parentRunId) return;
+  if (!parentSubagentSummaries.has(parentRunId)) parentSubagentSummaries.set(parentRunId, []);
+  const list = parentSubagentSummaries.get(parentRunId);
+  if (list.length < 8) list.push(summary); // cap 8 per parent
+}
+
+// ─── Phase 4 (B.1): skill_learner_nominate tool definition ───────────────────
+const NOMINATION_DIR = path.join(DATA_DIR, "nominations");
+const NOMINATION_LOG = path.join(DATA_DIR, "nomination-log.jsonl");
+
+async function writeNominationFile(runId, payload) {
+  await fs.mkdir(NOMINATION_DIR, { recursive: true });
+  const ts = Date.now();
+  const fname = `${runId || "unknown"}-${ts}.json`;
+  const full = path.join(NOMINATION_DIR, fname);
+  const body = { ...payload, runId, _submittedAt: new Date().toISOString() };
+  await fs.writeFile(full, JSON.stringify(body, null, 2), "utf-8");
+  // Audit log (JSONL, append-only)
+  try {
+    await fs.appendFile(NOMINATION_LOG, JSON.stringify({ ts, runId, file: full, topic: payload.topic }) + "\n");
+  } catch {}
+  return { nominationId: fname.replace(/\.json$/, ""), filePath: full };
+}
+
+// Build the tool object OpenClaw registers. We attach runId from the plugin
+// tool context so polyfill↔first-class share the same downstream path.
+function buildNominationTool() {
+  return {
+    name: "skill_learner_nominate",
+    label: "Skill Learner: Nominate",
+    description: [
+      "Mark the current session as a skill-learner nomination (Phase B self-nomination).",
+      "Call exactly once at the end of a session when ANY holds:",
+      "  1) you went down a wrong path and corrected yourself,",
+      "  2) you combined ≥3 tools in a non-obvious sequence that worked,",
+      "  3) you hit a pitfall and learned a new pattern,",
+      "  4) you abandoned your first plan for a materially better approach.",
+      "Do NOT call for routine tasks that follow existing skills or AGENTS.md.",
+      "Honesty matters — this is a high-trust signal for the external evaluator.",
+      "Max 3 nominations per run.",
+    ].join(" "),
+    parameters: Type.Object({
+      topic: Type.String({
+        description: "≤1 sentence summary of the reusable pattern (≤100 chars).",
+        minLength: 1,
+        maxLength: 100,
+      }),
+      pain_point: Type.String({
+        description: "What caused the detour on this run (≤300 chars).",
+        minLength: 1,
+        maxLength: 300,
+      }),
+      reusable_pattern: Type.String({
+        description: "Abstract reusable pattern, no filenames or system-specific paths (≤500 chars).",
+        minLength: 1,
+        maxLength: 500,
+      }),
+      confidence: Type.Union([
+        Type.Literal("high"), Type.Literal("medium"), Type.Literal("low"),
+      ], { description: "Agent self-estimated confidence." }),
+      evidence_turns: Type.Optional(Type.Array(Type.Number(), {
+        description: "Turn indices (0-based) pointing at key evidence. ≤8 items.",
+        maxItems: 8,
+      })),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate) {
+      // toolCtx is plumbed via closure by the factory below.
+      const runId = this.__runId || "__default__";
+      const run = getOrCreateRun(runId);
+      if (run.nominationCount >= 3) {
+        return {
+          content: [{ type: "text", text: "nomination cap (3/run) reached" }],
+          details: { status: "rejected", reason: "cap" },
+        };
+      }
+      try {
+        const { nominationId, filePath } = await writeNominationFile(runId, params);
+        run.nominated = true;
+        run.nominationCount += 1;
+        run.nominationPayload = { ...params, _firstClass: true, _filePath: filePath };
+        console.log(`[skill-learner] 🎯 First-class nomination: ${params.topic}`);
+        return {
+          content: [{ type: "text", text: `queued: ${nominationId}` }],
+          details: { status: "queued", nominationId, runId },
+        };
+      } catch (err) {
+        return {
+          content: [{ type: "text", text: `nomination failed: ${err.message}` }],
+          details: { status: "error", error: err.message },
+        };
+      }
+    },
+  };
+}
+
 // ─── Plugin Entry ────────────────────────────────────────────────────────────
 export default definePluginEntry({
   id: "jarvis-skill-learner",
@@ -360,7 +535,59 @@ export default definePluginEntry({
   description: "Auto-detect reusable patterns from complex sessions and create skill drafts",
 
   register: (api) => {
-    console.log("[skill-learner] 🧠 Plugin registered (Phase 3: Self-Evolution). Hooks: after_tool_call, agent_end, session_end");
+    console.log("[skill-learner] 🧠 Plugin registered (Phase 4: SDK-Native). Hooks: after_tool_call, agent_end, session_end, subagent_spawned, subagent_ended + tool: skill_learner_nominate");
+
+    // ── Phase 4 B.1: register skill_learner_nominate as a first-class tool ────────────
+    // We use the tool factory form so every invocation can read the caller's runId
+    // via the ctx passed to the factory. Each execute() closure then captures runId
+    // and routes through the shared nomination writer.
+    api.registerTool((toolCtx) => {
+      const baseTool = buildNominationTool();
+      // Attach runId via bound wrapper — execute() reads it from `this` in its body.
+      const runId = toolCtx?.sessionKey ? (toolCtx.sessionKey + ":" + (toolCtx.sessionId || "")) : undefined;
+      // Override execute so we can inject runId without relying on `this`.
+      const origExecute = baseTool.execute;
+      baseTool.execute = async function execute(toolCallId, params, signal, onUpdate) {
+        // Prefer runId from current active run state if available, else fall back
+        // to context-derived key. The plugin's per-run map is keyed on the hook's
+        // ctx.runId at after_tool_call time, so the execute path should resolve to
+        // the same run so nominated=true is observed before agent_end fires.
+        const injected = toolCtx?.runId || runId || "__default__";
+        const boundThis = { __runId: injected };
+        return origExecute.call(boundThis, toolCallId, params, signal, onUpdate);
+      };
+      return baseTool;
+    }, { name: "skill_learner_nominate" });
+
+    // ── Phase 4 C.1.c: sub-agent lifecycle tracking ──────────────────────────────
+    // subagent_spawned: build parent↔child map. The child's own agent_end hook will
+    // fire independently when it finishes; at that point we'll look up the parent.
+    api.on("subagent_spawned", (event, ctx) => {
+      const childRunId = event.runId || ctx?.runId;
+      const parentRunId = ctx?.requesterSessionKey || null; // requester side
+      if (!childRunId) return;
+      registerSubagentSpawn(childRunId, parentRunId, {
+        childSessionKey: event.childSessionKey,
+        agentId: event.agentId,
+        label: event.label || null,
+        mode: event.mode,
+      });
+      console.log(`[skill-learner] 👶 Subagent spawned: child=${childRunId} parent=${parentRunId} agent=${event.agentId}`);
+    });
+
+    // subagent_ended: capture outcome + attach outcome to the child's summary slot.
+    // The actual transcript summary is built when the child's agent_end fires;
+    // here we only record the terminal outcome so we know whether it succeeded.
+    api.on("subagent_ended", (event, ctx) => {
+      const childRunId = event.runId || ctx?.runId;
+      if (!childRunId) return;
+      const reg = subagentRegistry.get(childRunId);
+      if (!reg) return;
+      reg.outcome = event.outcome || "unknown";
+      reg.endedAt = event.endedAt || Date.now();
+      reg.error = event.error || null;
+      console.log(`[skill-learner] 👴 Subagent ended: child=${childRunId} outcome=${reg.outcome}`);
+    });
 
     // ── Hook 1: after_tool_call ───────────────────────────────────────────────
     api.on("after_tool_call", (event, ctx) => {
@@ -378,6 +605,10 @@ export default definePluginEntry({
         durationMs: event.durationMs || 0,
         error: event.error || null,
       });
+      // Phase 4 C.1.b: capture sanitized params into a per-run trace for later inclusion
+      // in the evaluate payload. Plugin already received full params via after_tool_call,
+      // we just weren't using them. Secrets redacted, strings capped.
+      appendToolTrace(run, event.toolName, event.params, event.error, event.durationMs);
       recordToolUsage(event.toolName, event.durationMs, event.error);
 
       // ── Friction: track errors per tool ────────────────────────────────────
@@ -535,6 +766,35 @@ export default definePluginEntry({
         console.log(`[skill-learner] 🧬 Friction detected (weight=${friction.totalWeight}) → evolution trigger for: ${friction.targetSkill}`);
       }
 
+      // Phase 4 C.1.c: if this run is a sub-agent run, push a compact summary up
+      // to the parent run's queue (so the parent evaluation later sees what the
+      // child did) instead of emitting a separate evaluation for the child alone.
+      const subagentReg = subagentRegistry.get(runId);
+      if (subagentReg && subagentReg.parentRunId) {
+        appendSubagentSummary(subagentReg.parentRunId, {
+          childRunId: runId,
+          agentId: subagentReg.agentId || ctx.agentId,
+          mode: subagentReg.mode,
+          toolCount: count,
+          toolNames: [...new Set(run.toolCalls.map(t => t.name))],
+          userMessages: (summary?.userMessages || []).slice(0, 3),
+          assistantTexts: (summary?.assistantTexts || []).slice(0, 3),
+          outcome: subagentReg.outcome || "unknown",
+          error: subagentReg.error || null,
+        });
+        console.log(`[skill-learner] ↗️  Sub-agent summary forwarded to parent ${subagentReg.parentRunId}`);
+        // Don't emit a standalone evaluation for the child run — parent is the
+        // canonical context. Mark to skip session_end fallback too.
+        agentEndFiredHttp.add(runId);
+        return;
+      }
+
+      // Pull any sub-agent summaries accumulated under this (parent) runId.
+      const childSummaries = parentSubagentSummaries.get(runId) || [];
+      if (childSummaries.length > 0) {
+        console.log(`[skill-learner] 📊 Including ${childSummaries.length} sub-agent summaries in parent eval`);
+      }
+
       // Build payload
       const payload = {
         runId: runId,
@@ -548,6 +808,9 @@ export default definePluginEntry({
         assistantTexts: summary?.assistantTexts || [],
         lastInboundMessageId: summary?.lastInboundMessageId || null,
         timestamp: new Date().toISOString(),
+        // Phase 4 C.1.b: sanitized tool-call trace (params + errors) for richer signals
+        // Hard-capped at TOOL_TRACE_MAX entries; secrets redacted; strings truncated.
+        toolTrace: run.toolTrace || [],
         // Phase C: best-effort forward of session JSONL path so the evaluator can
         // optionally read the full transcript. When OpenClaw exposes it in agent_end
         // (C.1 roadmap), this lights up automatically; until then it's usually null.
@@ -559,13 +822,18 @@ export default definePluginEntry({
         triggerEvolution,
         // Track 2: correction signals for user modeling
         correctionSignals,
-        // Phase B: agent self-nomination (B.2)
+        // Phase B: agent self-nomination (first-class via tool, polyfill via file write)
         nominated: !!run.nominated,
         nominationPayload: run.nominationPayload || null,
+        // Phase 4 C.1.c: sub-agent summaries collected under this parent run
+        subagentSummaries: childSummaries,
       };
 
       // Mark so session_end skips re-queuing
       agentEndFiredHttp.add(runId);
+
+      // Cleanup parent's child-summary slot
+      parentSubagentSummaries.delete(runId);
 
       // Fire-and-forget HTTP POST
       fireEvaluate(payload, null);
@@ -641,7 +909,7 @@ export default definePluginEntry({
 
     // ── Hook 4: gateway_start ────────────────────────────────────────────────
     api.on("gateway_start", () => {
-      console.log("[skill-learner] 🧠 Skill Learner Phase 2 active. Threshold: ≥" + TOOL_CALL_THRESHOLD + " tool calls → real-time HTTP evaluation.");
+      console.log("[skill-learner] 🧠 Skill Learner Phase 4 active. Threshold: ≥" + TOOL_CALL_THRESHOLD + " tool calls | tool: skill_learner_nominate | hooks: subagent_spawned/ended | params redaction ON.");
     });
   },
 });

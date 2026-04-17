@@ -54,6 +54,120 @@ def _load_recent_rejections_note() -> str:
     )
 
 
+# ─── Phase 4 (C.1.b/C.1.c) context enrichers ──────────────────────────────
+_TOOL_TRACE_RENDER_CAP = 20          # render at most this many entries in prompt
+_TOOL_TRACE_PARAM_CHARS = 180        # per-field truncation when rendering
+_SUBAGENT_RENDER_CAP = 5             # render at most this many child summaries
+
+
+def _format_params_inline(params: dict | None) -> str:
+    """Render a redacted params dict inline, heavily truncated for prompt budget.
+
+    Plugin already ran `sanitizeParams` (secrets redacted, long strings tagged);
+    we just need to keep the prompt budget under control.
+    """
+    if not isinstance(params, dict) or not params:
+        return ""
+    skip = {"__truncated"}
+    parts = []
+    truncated_note = params.get("__truncated") is True
+    for k, v in params.items():
+        if k in skip:
+            continue
+        if isinstance(v, (dict, list)):
+            try:
+                v_str = json.dumps(v, ensure_ascii=False)
+            except Exception:
+                v_str = str(v)
+        else:
+            v_str = str(v)
+        if len(v_str) > _TOOL_TRACE_PARAM_CHARS:
+            v_str = v_str[:_TOOL_TRACE_PARAM_CHARS] + "…"
+        parts.append(f"{k}={v_str}")
+    rendered = ", ".join(parts) if parts else "(no params)"
+    if truncated_note:
+        rendered += " [payload-truncated]"
+    return rendered
+
+
+def _build_tool_trace_note(trace: list | None) -> str:
+    """Format a sanitized tool trace as an ordered timeline for Gemini.
+
+    Phase 4 C.1.b: plugin's `appendToolTrace` already redacts secrets and caps
+    each entry. Here we further truncate for prompt budget and show the first N.
+    """
+    if not isinstance(trace, list) or not trace:
+        return ""
+    lines = []
+    rendered = 0
+    for entry in trace[:_TOOL_TRACE_RENDER_CAP]:
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("name") or "?"
+        err = entry.get("error")
+        params_str = _format_params_inline(entry.get("params"))
+        tag = f" ❌ error={str(err)[:80]}" if err else ""
+        dur = entry.get("durationMs")
+        dur_str = f" ({int(dur)}ms)" if isinstance(dur, (int, float)) and dur else ""
+        lines.append(f"{rendered + 1}. {name}{dur_str}{tag}  params: {params_str}")
+        rendered += 1
+    if rendered == 0:
+        return ""
+    more = len(trace) - rendered
+    suffix = f"\n  (+{more} earlier call(s) elided)" if more > 0 else ""
+    return (
+        "\n━━━ 本次 session 工具调用轨迹 (redacted, Phase 4 C.1.b) ━━━\n"
+        "从轨迹可以判断:调用顺序是否有模式价值,是否出现错误恢复,是否组合了非显然工具。\n"
+        + "\n".join(lines)
+        + suffix
+        + "\n"
+    )
+
+
+def _build_subagent_note(summaries: list | None) -> str:
+    """Format sub-agent (sessions_spawn) child summaries for parent session eval.
+
+    Phase 4 C.1.c: each summary carries the child run's toolCount / toolNames /
+    first 3 user+assistant messages + outcome. Gives Gemini visibility into the
+    spawned work that the parent's own transcript otherwise hides.
+    """
+    if not isinstance(summaries, list) or not summaries:
+        return ""
+    blocks = []
+    for idx, s in enumerate(summaries[:_SUBAGENT_RENDER_CAP], start=1):
+        if not isinstance(s, dict):
+            continue
+        agent_id = s.get("agentId") or "sub-agent"
+        tool_count = s.get("toolCount") or 0
+        tool_names = ", ".join((s.get("toolNames") or [])[:8])
+        outcome = s.get("outcome") or "unknown"
+        err = s.get("error")
+        user_msgs = s.get("userMessages") or []
+        asst_texts = s.get("assistantTexts") or []
+        u_join = "\n    ".join((m or "")[:300] for m in user_msgs[:3])
+        a_join = "\n    ".join((t or "")[:300] for t in asst_texts[:3])
+        header = f"[{idx}] {agent_id}  tools={tool_count} ({tool_names})  outcome={outcome}"
+        if err:
+            header += f"  error={str(err)[:80]}"
+        blocks.append(
+            header
+            + ("\n  用户消息 (前 3):\n    " + u_join if u_join else "")
+            + ("\n  Agent 回复 (前 3):\n    " + a_join if a_join else "")
+        )
+    if not blocks:
+        return ""
+    more = len(summaries) - len(blocks)
+    suffix = f"\n(+{more} other sub-agent(s) elided)" if more > 0 else ""
+    return (
+        "\n━━━ 子 Agent 派发任务上下文 (Phase 4 C.1.c) ━━━\n"
+        "父 session 通过 sessions_spawn 派发给子 agent 的工作在此:\n"
+        "判断模式可复用性时,子 run 的工具链也要纳入考量 (之前是盲区)。\n\n"
+        + "\n\n".join(blocks)
+        + suffix
+        + "\n"
+    )
+
+
 def build_new_skill_prompt(request: dict, existing_summary: str) -> str:
     """Build prompt for evaluating whether a session should produce a NEW skill."""
     tool_info = f"{request['toolCount']} calls ({', '.join(request.get('toolNames', [])[:10])})"
@@ -78,7 +192,14 @@ def build_new_skill_prompt(request: dict, existing_summary: str) -> str:
     # Phase A.4: inject recent user rejections as negative examples
     rejections_note = _load_recent_rejections_note()
 
-    # Phase B.4: if agent self-nominated, lift it as a high-trust signal block.
+    # Phase 4 C.1.b: per-call tool trace (redacted params)
+    tool_trace_note = _build_tool_trace_note(request.get("toolTrace"))
+
+    # Phase 4 C.1.c: sub-agent (sessions_spawn) child summaries
+    subagent_note = _build_subagent_note(request.get("subagentSummaries"))
+
+    # Phase B.4 + Phase 4 B.1: agent self-nomination as high-trust signal.
+    # Now distinguishes first-class tool (complete payload) from polyfill paths.
     nomination_note = ""
     if request.get("nominated") and isinstance(request.get("nominationPayload"), dict):
         np = request["nominationPayload"]
@@ -91,26 +212,44 @@ def build_new_skill_prompt(request: dict, existing_summary: str) -> str:
             evidence_str = ", ".join(f"turn {t}" for t in evidence[:8])
         else:
             evidence_str = str(evidence)
-        # Only emit the block if the nomination has at least topic — else treat as polyfill-only
-        if topic or reusable or pain:
+        is_first_class = bool(np.get("_firstClass"))
+        is_polyfill = bool(np.get("_polyfill"))
+
+        if is_first_class and (topic or reusable or pain):
+            # Phase 4 B.1 first-class tool path — highest trust.
             nomination_note = (
-                "\n━━━ AGENT SELF-NOMINATION (高信任信号) ━━━\n"
-                f"Jarvis 在本次 session 结束前主动调用了 skill_learner_nominate。\n"
+                "\n━━━ AGENT SELF-NOMINATION (first-class tool, 最高信任信号) ━━━\n"
+                f"Jarvis 在本次 session 主动调用了 `skill_learner_nominate` 工具。\n"
                 f"  Topic: {topic or '(未填)'}\n"
                 f"  Pain point: {pain or '(未填)'}\n"
                 f"  Reusable pattern: {reusable or '(未填)'}\n"
                 f"  Confidence: {conf}\n"
                 f"  Evidence turns: {evidence_str or '(未标注)'}\n"
-                "\n权重说明：Agent 自证发现了可沉淀模式,这是比外部观察更可靠的信号。\n"
+                "\n权重说明:这是 OpenClaw 原生工具路径——agent 明确声明本次有可沉淀模式,\n"
+                "这是比 polyfill 更强的信号(agent 走工具 schema 校验,而不是写 JSON 文件)。\n"
                 "  • 若 session 内容能支持 Jarvis 的自述 → 倾向 QUALIFY,即便 deviation 不显眼。\n"
-                "  • 若 session 与 nomination 完全不匹配（Jarvis 说发现了 X,transcript 里看不到 X）→ 仍可 NO_SKILL。\n"
+                "  • 若 session 与 nomination 完全不匹配(Jarvis 说发现了 X,transcript 里看不到 X)→ 仍可 NO_SKILL。\n"
                 "  • confidence=low 的 nomination 需要更强 session 佐证才 qualify。\n"
             )
-        elif np.get("_polyfill"):
+        elif topic or reusable or pain:
+            # Polyfill path with full payload (agent wrote JSON file with all fields).
+            label = "via polyfill file" if is_polyfill else "via polyfill"
+            nomination_note = (
+                f"\n━━━ AGENT SELF-NOMINATION ({label}, 高信任信号) ━━━\n"
+                f"Jarvis 在本次 session 通过 polyfill 文件写入的方式提名(first-class 工具未就绪时降级)。\n"
+                f"  Topic: {topic or '(未填)'}\n"
+                f"  Pain point: {pain or '(未填)'}\n"
+                f"  Reusable pattern: {reusable or '(未填)'}\n"
+                f"  Confidence: {conf}\n"
+                f"  Evidence turns: {evidence_str or '(未标注)'}\n"
+                "\n权重与 first-class 相同:polyfill 只是传输路径不同,语义等价。\n"
+            )
+        elif is_polyfill:
+            # Polyfill path but plugin couldn't read the payload (write→only got path).
             nomination_note = (
                 "\n━━━ AGENT NOMINATION (polyfill,payload 未捕获) ━━━\n"
-                "Jarvis 向 nominations/ 目录写了文件但 plugin 未能直接读取 payload。\n"
-                "按常规标准评估,但把「agent 认为有料」作为弱加分。\n"
+                "Jarvis 向 nominations/ 目录写了文件但 plugin 只看到 file path 没读内容。\n"
+                "按常规标准评估,但把「agent 主动标记」作为弱加分。\n"
             )
 
     prompt = (
@@ -143,6 +282,8 @@ def build_new_skill_prompt(request: dict, existing_summary: str) -> str:
         f"{existing_summary}\n"
         f"{rejections_note}"
         f"{nomination_note}"
+        f"{tool_trace_note}"
+        f"{subagent_note}"
         "\n"
         "━━━ WHAT IS AN OPENCLAW SKILL ━━━\n"
         "A Skill is a reusable *agent behavioral pattern* — a guide for HOW Jarvis should approach\n"

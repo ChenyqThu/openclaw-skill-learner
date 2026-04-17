@@ -1,9 +1,12 @@
 {
   "name": "@jarvis/skill-learner",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "type": "module",
   "main": "index.js",
   "description": "Auto-learn reusable skills from complex agent sessions via OpenClaw hooks",
+  "dependencies": {
+    "@sinclair/typebox": "0.34.49"
+  },
   "openclaw": {
     "extensions": ["./index.js"]
   }

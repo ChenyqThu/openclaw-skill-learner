@@ -189,6 +189,11 @@ def write_queue_file(body: dict) -> str:
         "nominationPayload": body.get("nominationPayload") or None,
         "frictionWeight": body.get("frictionWeight", 0),
         "frictionSignals": body.get("frictionSignals", []),
+        # Phase 4 SDK-native: tool-call trace (C.1.b) + sub-agent summaries (C.1.c).
+        # Plugin writes these via appendToolTrace() / appendSubagentSummary();
+        # evaluator prompt (v3_balanced.py) reads them back to enrich Gemini context.
+        "toolTrace": body.get("toolTrace") or [],
+        "subagentSummaries": body.get("subagentSummaries") or [],
         "status": "pending",
         "source": "evaluate-server",
     }
