@@ -40,3 +40,8 @@ EVOLUTION_TSV = Path(__file__).parent / "darwin-results" / "evolution-results.ts
 CORRECTION_LOG = DATA_DIR / "correction-signals.json"
 PENDING_UPDATES = DATA_DIR / "pending-user-updates.json"
 USER_MODELING_LOG = DATA_DIR / "user-modeling.log"
+
+# ─── Skill Curator (Track 4) ────────────────────────────────────────────────
+SKILL_USAGE_FILE = DATA_DIR / "skill-usage.json"
+CURATOR_REPORTS_DIR = DATA_DIR / "curator-reports"
+ARCHIVED_SKILLS_DIR = ALL_SKILLS_DIR / "_archived"

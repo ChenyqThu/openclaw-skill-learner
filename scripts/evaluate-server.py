@@ -794,6 +794,133 @@ def send_evolution_report(skill_name: str, result, friction_signals: list, error
         log.warning(f"Evolution report exception: {e}")
 
 
+# ─── Curator Report Card (Phase 3) ────────────────────────────────────────────
+
+def send_curator_report(run_dir):
+    """Send a Feishu card summarizing a curator LLM review with approve/reject buttons.
+
+    `run_dir` is a Path to data/skill-learner/curator-reports/<ts>/.
+    Reads run.json + REPORT.md from there.
+    """
+    import base64
+    from pathlib import Path
+    run_dir = Path(run_dir)
+    rj = run_dir / "run.json"
+    md = run_dir / "REPORT.md"
+    if not rj.exists():
+        log.warning(f"send_curator_report: missing {rj}")
+        return False
+
+    try:
+        doc = json.loads(rj.read_text())
+    except Exception as e:
+        log.warning(f"send_curator_report: bad JSON {e}")
+        return False
+
+    result = doc.get("result") or {}
+    cons = result.get("consolidations") or []
+    archs = result.get("archives") or []
+    if not cons and not archs:
+        log.info(f"send_curator_report: nothing actionable in {run_dir.name}")
+        return False
+
+    run_ts = run_dir.name
+    title_bits = []
+    if cons:
+        title_bits.append(f"合并 {len(cons)}")
+    if archs:
+        title_bits.append(f"归档 {len(archs)}")
+    title = f"📚 Skill Curator 复审 · {' / '.join(title_bits)}"
+
+    body_elements: list = [
+        {"tag": "markdown",
+         "content": f"**Run**: `{run_ts}`  ·  **审查 skills**: {doc.get('input_count', '?')}"},
+    ]
+
+    # Render REPORT.md as a collapsible panel for context.
+    report_md = md.read_text() if md.exists() else "(REPORT.md missing)"
+    body_elements.append({
+        "tag": "collapsible_panel", "expanded": False,
+        "background_color": "grey-50",
+        "header": {
+            "title": {"tag": "markdown", "content": "📎 **完整建议**"},
+            "background_color": "grey-100",
+        },
+        "border": {"color": "grey-200", "corner_radius": "8px"},
+        "elements": [{"tag": "markdown", "content": report_md[:3500], "text_size": "notation"}],
+    })
+
+    # Per-recommendation approve/reject buttons.
+    form_columns = []
+    for rec in cons + archs:
+        rec_id = rec.get("id", "?")
+        kind = rec.get("kind", "?")
+        if kind == "consolidate":
+            label = f"合并 {' + '.join(rec.get('skills', []))} → {rec.get('new_name', '?')}"
+        else:
+            label = f"归档 {rec.get('skill', '?')}"
+        encoded_id = base64.urlsafe_b64encode(rec_id.encode()).decode().rstrip("=")
+        form_columns.append({
+            "tag": "column", "width": "weighted", "weight": 1,
+            "elements": [
+                {"tag": "markdown", "content": f"**{label}**"},
+                {"tag": "column_set", "flex_mode": "none", "columns": [
+                    {"tag": "column", "width": "auto", "elements": [{
+                        "tag": "button", "type": "primary",
+                        "name": f"curator_approve||{encoded_id}||{run_ts}",
+                        "form_action_type": "submit",
+                        "text": {"tag": "plain_text", "content": "✅ 采纳"},
+                    }]},
+                    {"tag": "column", "width": "auto", "elements": [{
+                        "tag": "button", "type": "default",
+                        "name": f"curator_reject||{encoded_id}||{run_ts}",
+                        "form_action_type": "submit",
+                        "text": {"tag": "plain_text", "content": "⏭ 忽略"},
+                    }]},
+                ]},
+            ],
+        })
+    if form_columns:
+        body_elements.append({
+            "tag": "form", "name": "curator_action_form",
+            "elements": [
+                {"tag": "column_set", "flex_mode": "stretch",
+                 "columns": form_columns},
+            ],
+        })
+
+    card = {
+        "schema": "2.0",
+        "header": {
+            "title": {"tag": "plain_text", "content": title},
+            "template": "blue",
+        },
+        "body": {
+            "direction": "vertical",
+            "vertical_spacing": "8px",
+            "elements": body_elements,
+        },
+    }
+
+    card_json = json.dumps(card)
+    cmd = [
+        "openclaw", "message", "send",
+        "--channel", "feishu",
+        "--target", f"user:{FEISHU_TARGET_OPEN_ID}",
+        "--card", card_json,
+    ]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        if r.returncode == 0:
+            log.info(f"Curator report card sent for run {run_ts}")
+            return True
+        log.warning(f"Curator report send failed: {r.stderr.strip()}")
+        return False
+    except Exception as e:
+        log.warning(f"Curator report exception: {e}")
+        return False
+
+
 # ─── User Modeling Report Card ────────────────────────────────────────────────
 
 def send_modeling_report(proposals: list):
@@ -910,10 +1037,54 @@ class EvaluateHandler(BaseHTTPRequestHandler):
                 "rateLimitUsed": rate_used,
                 "rateLimitMax": RATE_LIMIT_PER_MIN,
             })
-        else:
-            self.send_json(404, {"error": "not found"})
+            return
+
+        # Track 4 (Curator): GET /curator/status
+        if self.path == "/curator/status":
+            try:
+                import sys as _sys
+                _sys.path.insert(0, str(Path(__file__).parent))
+                from curator_telemetry import read_usage, read_skill_meta, days_since
+                from curator_lifecycle import _locate_skill_dir
+                data = read_usage()
+                meta = data.get("_meta", {})
+                skills = data.get("skills", {})
+                summary = {"total": len(skills), "active": 0, "stale": 0,
+                           "archived": 0, "pinned": 0}
+                lru: list[dict] = []
+                for name, e in skills.items():
+                    summary[e.get("state", "active")] = summary.get(
+                        e.get("state", "active"), 0) + 1
+                    d = _locate_skill_dir(name)
+                    fm = read_skill_meta(d) if d else {}
+                    if fm.get("pinned"):
+                        summary["pinned"] += 1
+                    if e.get("applied_count", 0) == 0:
+                        lru.append({
+                            "name": name,
+                            "age_days": days_since(fm.get("created_at")),
+                            "read_count": e.get("read_count", 0),
+                            "source": fm.get("source", "?"),
+                        })
+                lru.sort(key=lambda x: -(x.get("age_days") or 0))
+                self.send_json(200, {
+                    "summary": summary,
+                    "lru_top3": lru[:3],
+                    "last_curator_tick_at": meta.get("last_curator_tick_at"),
+                    "last_llm_review_at": meta.get("last_llm_review_at"),
+                })
+            except Exception as e:
+                log.warning(f"GET /curator/status failed: {e}")
+                self.send_json(500, {"error": str(e)})
+            return
+
+        self.send_json(404, {"error": "not found"})
 
     def do_POST(self):
+        # Track 4 (Curator): POST /curator/*
+        if self.path.startswith("/curator/"):
+            return self._handle_curator_post()
+
         if self.path not in ("/evaluate", "/evolve", "/model"):
             self.send_json(404, {"error": "not found"})
             return
@@ -1015,6 +1186,83 @@ class EvaluateHandler(BaseHTTPRequestHandler):
 
         # Return 202 immediately (fire-and-forget from plugin side)
         self.send_json(202, {"status": "accepted", "toolCount": tool_count})
+
+    # ─── Track 4 (Curator) POST routes ───────────────────────────────────────
+    def _handle_curator_post(self):
+        """Dispatch /curator/{tick,run,pin,unpin,restore}."""
+        path = self.path
+        content_length = int(self.headers.get("Content-Length", 0))
+        try:
+            raw = self.rfile.read(content_length) if content_length else b"{}"
+            body = json.loads(raw or b"{}")
+        except Exception as e:
+            self.send_json(400, {"error": f"invalid JSON: {e}"})
+            return
+
+        # Make sure curator modules import cleanly.
+        import sys as _sys
+        from pathlib import Path as _Path
+        _sys.path.insert(0, str(_Path(__file__).parent))
+
+        if path == "/curator/tick":
+            try:
+                from curator_lifecycle import run_tick
+                result = run_tick(dry_run=bool(body.get("dryRun")),
+                                  commit=not bool(body.get("noCommit")))
+                self.send_json(202, result)
+            except Exception as e:
+                log.warning(f"/curator/tick failed: {e}")
+                self.send_json(500, {"error": str(e)})
+            return
+
+        if path == "/curator/run":
+            try:
+                from curator_llm import run_review
+                # Background thread so the request returns fast.
+                def _run():
+                    out = run_review(dry_run=bool(body.get("dryRun")),
+                                     send_feishu=not bool(body.get("noFeishu")))
+                    log.info(f"/curator/run result: {out.get('run_dir')} "
+                             f"warnings={out.get('warnings')}")
+                threading.Thread(target=_run, daemon=True).start()
+                self.send_json(202, {"status": "accepted",
+                                     "dry_run": bool(body.get("dryRun"))})
+            except Exception as e:
+                log.warning(f"/curator/run failed: {e}")
+                self.send_json(500, {"error": str(e)})
+            return
+
+        if path in ("/curator/pin", "/curator/unpin"):
+            skill = body.get("skill")
+            if not skill:
+                self.send_json(400, {"error": "skill required"})
+                return
+            try:
+                from curator_lifecycle import pin, unpin
+                fn = pin if path == "/curator/pin" else unpin
+                self.send_json(200, fn(skill))
+            except FileNotFoundError as e:
+                self.send_json(404, {"error": str(e)})
+            except Exception as e:
+                self.send_json(500, {"error": str(e)})
+            return
+
+        if path == "/curator/restore":
+            skill = body.get("skill")
+            if not skill:
+                self.send_json(400, {"error": "skill required"})
+                return
+            try:
+                from curator_lifecycle import apply_restore
+                self.send_json(200, apply_restore(skill,
+                                                  commit=not bool(body.get("noCommit"))))
+            except (FileNotFoundError, KeyError, FileExistsError, ValueError) as e:
+                self.send_json(400, {"error": str(e)})
+            except Exception as e:
+                self.send_json(500, {"error": str(e)})
+            return
+
+        self.send_json(404, {"error": f"unknown curator route: {path}"})
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 def main():

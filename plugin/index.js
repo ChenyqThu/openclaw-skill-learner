@@ -43,6 +43,13 @@ const DATA_DIR = path.join(os.homedir(), ".openclaw/workspace/data/skill-learner
 const MEMORY_MD_PATH = path.join(os.homedir(), ".openclaw/workspace/MEMORY.md");
 const EVALUATE_SERVER_URL = "http://127.0.0.1:8300/evaluate";
 
+// Track 4 (Curator): per-skill telemetry sidecar
+const SKILL_USAGE_FILE = path.join(DATA_DIR, "skill-usage.json");
+// Threshold: at agent_end, if a skill was read AND the run had >= this many
+// tool calls, bump applied_count. Smaller than TOOL_CALL_THRESHOLD so we
+// capture lightweight sessions that still applied a skill.
+const APPLIED_TOOLCALL_THRESHOLD = 5;
+
 // Memory health thresholds
 const MEMORY_LINE_WARN = 250;
 const MEMORY_LINE_DANGER = 300;
@@ -153,6 +160,72 @@ async function persistDailyStats() {
   } catch (err) {
     console.error("[skill-learner] Failed to persist tool stats:", err.message);
   }
+}
+
+// ─── Track 4 (Curator) — Per-skill Usage Telemetry ───────────────────────────
+// Increments read_count / applied_count / patch_count in skill-usage.json.
+// Plugin writes are best-effort: cross-process races with curator scripts are
+// handled by the Python side's fcntl lock; plugin's own concurrency is serialized
+// here via usageWriteChain (a single Promise chain per process). Atomic write
+// via tmp + rename so the file is never half-written.
+let usageWriteChain = Promise.resolve();
+
+function _emptyUsageEntry(nowIso) {
+  return {
+    read_count: 0,
+    applied_count: 0,
+    patch_count: 0,
+    last_read_at: null,
+    last_applied_at: null,
+    last_patched_at: null,
+    state: "active",
+    state_changed_at: nowIso,
+    archived_at: null,
+    archive_path: null,
+  };
+}
+
+function bumpSkillUsage(skillName, counterKey, lastKey) {
+  if (!skillName || typeof skillName !== "string") return Promise.resolve();
+  usageWriteChain = usageWriteChain.then(async () => {
+    try {
+      await fs.mkdir(DATA_DIR, { recursive: true });
+      let doc = { _meta: { schema_version: 1, last_curator_tick_at: null, last_llm_review_at: null }, skills: {} };
+      try {
+        doc = JSON.parse(await fs.readFile(SKILL_USAGE_FILE, "utf-8"));
+      } catch { /* missing or unreadable — start fresh */ }
+      if (!doc._meta) doc._meta = { schema_version: 1, last_curator_tick_at: null, last_llm_review_at: null };
+      if (!doc.skills) doc.skills = {};
+
+      const nowIso = new Date().toISOString();
+      if (!doc.skills[skillName]) doc.skills[skillName] = _emptyUsageEntry(nowIso);
+      const entry = doc.skills[skillName];
+      entry[counterKey] = (entry[counterKey] || 0) + 1;
+      entry[lastKey] = nowIso;
+
+      const tmp = SKILL_USAGE_FILE + ".tmp";
+      await fs.writeFile(tmp, JSON.stringify(doc, null, 2), "utf-8");
+      await fs.rename(tmp, SKILL_USAGE_FILE);
+    } catch (err) {
+      console.error(`[skill-learner] bumpSkillUsage(${skillName}, ${counterKey}) failed:`, err.message);
+    }
+  });
+  // Errors are caught above; surface a settled promise so callers can fire-and-forget.
+  return usageWriteChain;
+}
+
+const bumpSkillRead    = (n) => bumpSkillUsage(n, "read_count",    "last_read_at");
+const bumpSkillApplied = (n) => bumpSkillUsage(n, "applied_count", "last_applied_at");
+const bumpSkillPatched = (n) => bumpSkillUsage(n, "patch_count",   "last_patched_at");
+
+// Match `/skills/<name>/SKILL.md` (top-level, auto-learned, or _archived/ subtree).
+// Captures the immediate parent dir as the skill name.
+const SKILL_MD_PATH_RE = /\/skills\/(?:auto-learned\/|_archived\/)?([^/]+)\/SKILL\.md$/;
+
+function extractSkillNameFromPath(p) {
+  if (typeof p !== "string") return null;
+  const m = p.match(SKILL_MD_PATH_RE);
+  return m ? m[1] : null;
 }
 
 // ─── Transcript Extraction from event.messages ───────────────────────────────
@@ -636,16 +709,27 @@ export default definePluginEntry({
 
       // Detect skill loading via Read_tool on SKILL.md
       if (event.toolName === "Read_tool" || event.toolName === "read") {
-        const filePath = event.params?.path || "";
-        const skillMatch = filePath.match(/\/skills\/([^/]+)\/SKILL\.md/);
-        if (skillMatch) {
-          const skillName = skillMatch[1];
+        const skillName = extractSkillNameFromPath(event.params?.path || "");
+        if (skillName) {
           if (!runSkillsUsed.has(runId)) runSkillsUsed.set(runId, new Set());
           runSkillsUsed.get(runId).add(skillName);
           // Track for friction correlation
           run.lastSkillReadIndex = tcIndex;
           run.lastSkillReadName = skillName;
+          // Track 4: bump read_count (fire-and-forget; serialized via usageWriteChain)
+          bumpSkillRead(skillName);
           console.log(`[skill-learner] 📖 Skill loaded: ${skillName}`);
+        }
+      }
+
+      // Track 4: detect skill patches via Write/Edit on SKILL.md
+      if (event.toolName === "Write_tool" || event.toolName === "write" ||
+          event.toolName === "write_tool" || event.toolName === "Edit_tool" ||
+          event.toolName === "edit") {
+        const patchedSkill = extractSkillNameFromPath(event.params?.path || event.params?.file_path || "");
+        if (patchedSkill) {
+          bumpSkillPatched(patchedSkill);
+          console.log(`[skill-learner] ✏️  Skill patched: ${patchedSkill}`);
         }
       }
 
@@ -698,6 +782,19 @@ export default definePluginEntry({
       if (!run) return;
 
       const count = run.toolCalls.length;
+
+      // ── Track 4: bump applied_count for skills used in this run ─────────────
+      // Fires regardless of whether the run hits TOOL_CALL_THRESHOLD (15) — the
+      // applied threshold (5) is lower so we capture lightweight skill uses too.
+      if (count >= APPLIED_TOOLCALL_THRESHOLD) {
+        const skillsThisRun = runSkillsUsed.get(runId);
+        if (skillsThisRun && skillsThisRun.size > 0) {
+          for (const skillName of skillsThisRun) {
+            bumpSkillApplied(skillName);
+          }
+        }
+      }
+
       if (count < TOOL_CALL_THRESHOLD) {
         // Housekeeping: keep last 10 runs, clean all related maps/sets
         if (runStats.size > 20) {

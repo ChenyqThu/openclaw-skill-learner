@@ -37,7 +37,11 @@ FRICTION_LOG = WORKSPACE / "data/skill-learner/friction-signals.json"
 
 # ─── Safety: files that MUST NEVER be modified by evolution ──────────────────
 BLOCKED_FILES = {"SOUL.md", "AGENTS.md", "USER.md", "MEMORY.md"}
-BLOCKED_PATHS = {"auto-learned"}
+# `auto-learned` = drafts pre-approval; `_archived`/`archived` = curator-archived skills
+BLOCKED_PATHS = {"auto-learned", "_archived", "archived"}
+
+# Track 4 (Curator) frontmatter fields that Darwin must not strip on rewrite.
+CURATOR_PROTECTED_FIELDS = ("pinned", "source", "created_at")
 
 # ─── 8-Dimension Scoring Rubric (from darwin-skill) ─────────────────────────
 # Structure (60 points): static analysis of SKILL.md content
@@ -162,7 +166,44 @@ def validate_skill(skill_name: str) -> str | None:
     if "auto-learned" in str(skill_dir):
         return "Cannot evolve auto-learned drafts (must be approved first)"
 
+    # Track 4 (Curator): pin protection. Skip if frontmatter pinned: true.
+    try:
+        from curator_telemetry import read_skill_meta
+        meta = read_skill_meta(skill_dir)
+        if meta.get("pinned"):
+            return f"Blocked: {skill_name} is pinned (curator protection)"
+    except ImportError:
+        pass  # curator not installed — fall through
+
     return None
+
+
+def _missing_curator_fields(original: str, rewritten: str) -> list[str]:
+    """Return curator fields present in original frontmatter but missing in rewritten.
+
+    Skips the check if the original itself lacked any of these fields (e.g. Phase 1
+    migration hasn't been run yet against this skill).
+    """
+    import re
+    fm_re = re.compile(r"\A---\s*\n(.*?)\n---\s*\n", re.DOTALL)
+    om = fm_re.match(original)
+    nm = fm_re.match(rewritten)
+    if not om or not nm:
+        return []  # nothing to enforce — the existing "starts with ---" check covers it
+
+    def _has(body: str, field: str) -> bool:
+        # Top-level (unindented) `field:` only.
+        for line in body.splitlines():
+            if line and line[0] not in (" ", "\t") and \
+                    re.match(rf"^{re.escape(field)}\s*:", line):
+                return True
+        return False
+
+    missing = []
+    for f in CURATOR_PROTECTED_FIELDS:
+        if _has(om.group(1), f) and not _has(nm.group(1), f):
+            missing.append(f)
+    return missing
 
 
 def list_eligible_skills() -> list[str]:
@@ -394,7 +435,8 @@ STRATEGIES:
 1. Make ONE targeted improvement to the weakest dimension
 2. Do NOT change the skill's core purpose or function
 3. Do NOT add new external dependencies
-4. Keep the same YAML frontmatter structure
+4. Keep the YAML frontmatter intact, especially these curator fields VERBATIM:
+   `pinned`, `source`, `created_at`. Removing any of them will fail validation.
 5. Keep file size reasonable (optimized ≤ 150% of original)
 6. Preserve the language style (Chinese-first if original is Chinese)
 7. Do NOT remove existing content that scores well on other dimensions
@@ -504,6 +546,13 @@ class SkillEvolver:
             # Validate improved content has frontmatter
             if not improved.strip().startswith("---"):
                 print(f"  ERROR: Improved content missing frontmatter, skipping.")
+                break
+
+            # Track 4 (Curator): make sure Gemini didn't drop curator fields
+            missing_curator = _missing_curator_fields(current_content, improved)
+            if missing_curator:
+                print(f"  ERROR: Gemini dropped curator field(s) {missing_curator}; "
+                      f"discarding this round to protect frontmatter integrity.")
                 break
 
             # Write and evaluate

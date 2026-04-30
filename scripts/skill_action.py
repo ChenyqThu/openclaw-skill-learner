@@ -219,6 +219,25 @@ def do_approve(skill_name: str, message_id: str | None):
         if p.exists():
             p.unlink()
 
+    # Track 4 (Curator): stamp source=auto_learned + bootstrap sidecar entry.
+    # Approved-on date is treated as the canonical created_at (the draft date is
+    # uninteresting to the curator — what matters is when the skill became active).
+    try:
+        from curator_telemetry import write_frontmatter_field, bootstrap_one
+        skill_md = dest / "SKILL.md"
+        today = datetime.now().strftime("%Y-%m-%d")
+        if skill_md.exists():
+            write_frontmatter_field(skill_md, "source", "auto_learned")
+            write_frontmatter_field(skill_md, "created_at", today)
+            write_frontmatter_field(skill_md, "pinned", False)
+        bootstrap_one(skill_name, source="auto_learned",
+                      created_at=today + "T00:00:00")
+        log(f"curator: stamped {skill_name} (source=auto_learned, created_at={today})")
+    except ImportError:
+        pass  # curator not installed
+    except Exception as e:
+        log(f"Warning: curator stamping failed for {skill_name}: {e}")
+
     # Update card or send confirmation
     if message_id:
         done_card = build_done_card(skill_name, "已落地")
@@ -368,15 +387,152 @@ def do_profile_reject(proposal_id: str, message_id: str | None):
     return 0 if ok else 1
 
 
+# ─── Track 4 (Curator) actions ──────────────────────────────────────────────
+
+def do_pin(skill_name: str, message_id: str | None):
+    """Pin a skill: set frontmatter pinned=true so Darwin/Curator skip it."""
+    try:
+        from curator_lifecycle import pin
+    except ImportError as e:
+        log(f"pin failed: import error {e}")
+        return 1
+    try:
+        r = pin(skill_name)
+    except FileNotFoundError as e:
+        log(f"pin failed: {e}")
+        return 1
+    log(f"pin: {r['name']} pinned (changed={r['changed']})")
+    return 0
+
+
+def do_unpin(skill_name: str, message_id: str | None):
+    try:
+        from curator_lifecycle import unpin
+    except ImportError as e:
+        log(f"unpin failed: import error {e}")
+        return 1
+    try:
+        r = unpin(skill_name)
+    except FileNotFoundError as e:
+        log(f"unpin failed: {e}")
+        return 1
+    log(f"unpin: {r['name']} unpinned (changed={r['changed']})")
+    return 0
+
+
+def do_restore(skill_name: str, message_id: str | None):
+    """Restore an archived skill: move from _archived/ back to active tree."""
+    try:
+        from curator_lifecycle import apply_restore
+    except ImportError as e:
+        log(f"restore failed: import error {e}")
+        return 1
+    try:
+        r = apply_restore(skill_name)
+    except (FileNotFoundError, KeyError, FileExistsError, ValueError) as e:
+        log(f"restore failed: {e}")
+        return 1
+    log(f"restore: {r['name']} → {r['to_path']}  [{r.get('git_sha') or 'no-commit'}]")
+    return 0
+
+
+def _resolve_curator_run_dir(run_ts: str | None):
+    """Locate a curator-reports/<ts> directory. Defaults to `latest` symlink."""
+    base = Path.home() / ".openclaw/workspace/data/skill-learner/curator-reports"
+    if run_ts:
+        d = base / run_ts
+        return d if d.exists() else None
+    latest = base / "latest"
+    if latest.exists():
+        return latest.resolve()
+    return None
+
+
+def do_curator_approve(rec_id: str, message_id: str | None,
+                       run_ts: str | None = None):
+    """Apply a single LLM curator recommendation (consolidation or archive)."""
+    try:
+        from curator_actions import (apply_archive_rec, apply_consolidation,
+                                      find_recommendation, mark_recommendation)
+    except ImportError as e:
+        log(f"curator_approve failed: import {e}")
+        return 1
+    run_dir = _resolve_curator_run_dir(run_ts)
+    if run_dir is None:
+        log(f"curator_approve: no run dir found (ts={run_ts})")
+        return 1
+
+    rec = find_recommendation(run_dir, rec_id)
+    if rec is None:
+        log(f"curator_approve: rec {rec_id!r} not found in {run_dir.name}")
+        return 1
+
+    kind = rec.get("kind")
+    try:
+        if kind == "consolidate":
+            r = apply_consolidation(rec)
+            log(f"curator_approve: consolidated {r['names']} → {r['new_name']}  "
+                f"[{r.get('git_sha') or 'no-commit'}]")
+        elif kind == "archive":
+            r = apply_archive_rec(rec)
+            log(f"curator_approve: archived {r['name']}  "
+                f"[{r.get('git_sha') or 'no-commit'}]")
+        else:
+            log(f"curator_approve: unknown rec kind {kind!r}")
+            return 1
+    except Exception as e:
+        log(f"curator_approve failed: {e}")
+        return 1
+
+    mark_recommendation(run_dir, rec_id, "approved")
+
+    if message_id:
+        try:
+            done_card = build_done_card(rec_id, "已采纳")
+            openclaw_edit_card(message_id, done_card)
+        except Exception:
+            pass
+    return 0
+
+
+def do_curator_reject(rec_id: str, message_id: str | None,
+                      run_ts: str | None = None, note: str = ""):
+    """Mark a curator recommendation rejected (no skill mutations)."""
+    try:
+        from curator_actions import find_recommendation, mark_recommendation
+    except ImportError as e:
+        log(f"curator_reject failed: import {e}")
+        return 1
+    run_dir = _resolve_curator_run_dir(run_ts)
+    if run_dir is None:
+        log(f"curator_reject: no run dir found (ts={run_ts})")
+        return 1
+    if find_recommendation(run_dir, rec_id) is None:
+        log(f"curator_reject: rec {rec_id!r} not found")
+        return 1
+    mark_recommendation(run_dir, rec_id, "rejected", note=note or None)
+    log(f"curator_reject: marked {rec_id} as rejected")
+    if message_id:
+        try:
+            done_card = build_done_card(rec_id, "已忽略")
+            openclaw_edit_card(message_id, done_card)
+        except Exception:
+            pass
+    return 0
+
+
 def main():
     load_env()
     parser = argparse.ArgumentParser(description="Handle skill candidate card callbacks")
     parser.add_argument("action", choices=["approve", "skip", "discuss", "revert",
-                                           "profile_approve", "profile_reject"])
-    parser.add_argument("skill_name", help="Skill name or proposal ID")
+                                           "profile_approve", "profile_reject",
+                                           "pin", "unpin", "restore",
+                                           "curator_approve", "curator_reject"])
+    parser.add_argument("skill_name", help="Skill name, proposal ID, or curator rec_id")
     parser.add_argument("--message-id", default=None, help="Feishu message_id of the card")
     parser.add_argument("--note", default="", help="Note for discuss action")
     parser.add_argument("--reason", default="", help="Rejection reason for skip action (goes to rejection-context.json)")
+    parser.add_argument("--run-ts", default=None, help="Curator run timestamp (for curator_approve/reject)")
     args = parser.parse_args()
 
     if args.action == "approve":
@@ -391,6 +547,18 @@ def main():
         sys.exit(do_profile_approve(args.skill_name, args.message_id))
     elif args.action == "profile_reject":
         sys.exit(do_profile_reject(args.skill_name, args.message_id))
+    elif args.action == "pin":
+        sys.exit(do_pin(args.skill_name, args.message_id))
+    elif args.action == "unpin":
+        sys.exit(do_unpin(args.skill_name, args.message_id))
+    elif args.action == "restore":
+        sys.exit(do_restore(args.skill_name, args.message_id))
+    elif args.action == "curator_approve":
+        sys.exit(do_curator_approve(args.skill_name, args.message_id,
+                                    run_ts=args.run_ts))
+    elif args.action == "curator_reject":
+        sys.exit(do_curator_reject(args.skill_name, args.message_id,
+                                   run_ts=args.run_ts, note=args.note))
 
 
 if __name__ == "__main__":
