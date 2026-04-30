@@ -1,15 +1,16 @@
 # 🧠 OpenClaw Skill Learner
 
-**Auto-learn and self-evolve reusable skills from agent sessions.**
+**Auto-learn, self-evolve, and curate reusable skills from agent sessions.**
 
-An OpenClaw plugin that brings Hermes-style self-evolution to the OpenClaw ecosystem — without modifying OpenClaw's source code. Now with Darwin-style skill evolution (Track 1) and agent-nominated learning + replay validation (Phase 4).
+An OpenClaw plugin that brings Hermes-style self-evolution to the OpenClaw ecosystem — without modifying OpenClaw's source code. Four tracks: skill extraction (Track 0), Darwin evolution (Track 1), user modeling (Track 2), and Hermes-inspired skill curator (Track 4 — per-skill telemetry + lifecycle + LLM consolidation review).
 
-> **Current Version**: Phase 4 (Supervision Loop Redesign)
-> — Track 0/1/2 + Agent Self-Nomination + Rejection Feedback + Replay Gate + Cross-Session Pattern Mining
+> **Current Version**: Phase 4.2 (Skill Curator)
+> — Track 0/1/2/4 + Agent Self-Nomination + Rejection Feedback + Replay Gate + Cross-Session Pattern Mining + Per-Skill Lifecycle
 > **Evaluation Accuracy**: 88.9/100 (v3 prompt, 16/18 correct on labeled test set)
 > **Evolution Engine**: 8-dimension scoring + hill-climbing ratchet
+> **Curator Engine**: per-skill `read/applied/patch` telemetry → deterministic state machine (active→stale→archived) → bi-weekly Gemini consolidation review
 > **Full project doc**: [OpenClaw Skill Learner — 项目文档 & 实现全记录](https://www.feishu.cn/wiki/OqW8wQhj6iJbZnkbMxWcNzLgnlb)
-> **Phase 4 design**: [plan file](../../../.claude/plans/review-openclaw-effervescent-squid.md) · **OpenClaw-side spec**: [OPENCLAW_COOPERATION_PHASE2.md](docs/OPENCLAW_COOPERATION_PHASE2.md)
+> **Phase 4 design**: [plan file](../../../.claude/plans/review-openclaw-effervescent-squid.md) · **Track 4 design**: [hermes curator plan](../../../.claude/plans/hermes-agent-curator-cryptic-fog.md) · **OpenClaw-side spec**: [OPENCLAW_COOPERATION_PHASE2.md](docs/OPENCLAW_COOPERATION_PHASE2.md)
 
 ---
 
@@ -57,6 +58,18 @@ Your conversations with Jarvis
 
 (Parallel) Phase E: cron scans analysis-queue every 14 days → Gemini clustering
   → ≥3 similar sessions → proactive-proposal-*.json → approval card
+
+(Parallel) Track 4: Skill Curator
+  ├── Plugin telemetry → skill-usage.json (read/applied/patch counters, real-time)
+  ├── Daily 05:30 cron — curator.py --tick
+  │     evaluate_transitions() → active→stale→archived (deterministic, no LLM)
+  │     archive: mv skills/X/ → skills/_archived/X-<date>/ + workspace git commit
+  │     pinned skills are skipped at every step
+  └── Every 14 days (if ≥5 active auto-learned)
+        Gemini review → consolidations + archives + keep
+        validator drops cross-source / applied>3 / unknown skills
+        curator-reports/<ts>/{run.json, REPORT.md} + latest symlink
+        Feishu 📚 card → 采纳/忽略 buttons → skill_action.py curator_approve|reject
 ```
 
 ---
@@ -76,6 +89,55 @@ Your conversations with Jarvis
 - **Auto test-prompt generation**: Gemini creates test-prompts.json for skills that don't have one
 - **Feishu evolution report**: 🧬 card with score delta, trigger signals, git diff, confirm/rollback buttons
 - **Git-backed**: All evolution on `auto-evolve/` branches, merged to main on success
+
+### 🧹 Skill Curator (Track 4 — Hermes-inspired, 2026-04-30)
+
+Borrows from Hermes Agent's Curator design to close the "skills only ever go in" gap. Adds per-skill telemetry, deterministic lifecycle, and bi-weekly LLM consolidation review.
+
+**Per-skill telemetry** (real-time via plugin):
+- `read_count` — `Read_tool` on a `SKILL.md` increments. Counts "agent considered this skill"
+- `applied_count` — `agent_end` of a run that read the skill AND made ≥5 tool calls. Counts "skill was actually applied"
+- `patch_count` — `Write_tool`/`Edit_tool` on a `SKILL.md` increments
+- Stored in `data/skill-learner/skill-usage.json`; plugin writes serialized via in-process Promise chain, atomic `tmp + rename`
+
+**SKILL.md frontmatter** (extended in 2026-04-30 migration): every skill now carries `pinned`, `source` (`auto_learned`/`user_created`), and `created_at` fields. Bootstrap script seeds `created_at` from `git log --diff-filter=A --reverse`.
+
+**Deterministic state machine** (no LLM, runs daily 5:30 AM):
+
+| From | To | Condition |
+|------|----|-----------|
+| active | stale | `auto_learned` AND never applied AND `age > 30d` |
+| active | stale | any skill with `last_applied_at > 60d` |
+| stale | archived | `state == stale` for 30+ days AND not `pinned` |
+
+Archived skills move to `skills/_archived/<name>-<date>/` with a workspace-git commit. `pinned: true` skips all transitions and blocks Darwin evolution.
+
+**LLM consolidation review** (every 14 days, when ≥5 active auto-learned skills):
+- Gemini scans all active (non-pinned) skills for overlap, narrowness, dead skills
+- Hard rules in prompt: never archive `applied_count > 3`; never cross-source consolidate; overlap must cite specific SKILL.md sections
+- Outputs `consolidations` / `archives` / `keep` arrays; local validator drops recommendations referencing missing skills or violating rules
+- Reports written to `data/skill-learner/curator-reports/<ISO-ts>/{run.json, REPORT.md}` + `latest` symlink
+- Feishu card with per-recommendation **采纳 / 忽略** buttons; **no auto-execution** — Lucien approves each
+
+**Pin protection matrix**:
+
+| Mechanism | Pinned skill behavior |
+|-----------|----------------------|
+| Curator state machine | Skip — no transitions |
+| Curator LLM review | Excluded from prompt input |
+| Darwin evolution (`validate_skill`) | Refused with `Blocked: pinned` |
+| Darwin Gemini rewrite | Frontmatter preserved; missing field → auto `git revert` |
+| `skill_action.py revert` | NOT blocked (intentional human action) |
+
+**CLI / HTTP / Jarvis natural-language entry points**:
+
+| Lucien says | Backend |
+|-------------|---------|
+| "curator 状态" / "skill 健康检查" | `GET /curator/status` (or `curator.py --status`) |
+| "手动跑 curator" | `POST /curator/run` |
+| "pin skill X" / "unpin X" | `POST /curator/{pin,unpin}` |
+| "恢复 skill X" | `POST /curator/restore` |
+| "看上次 curator 报告" | reads `curator-reports/latest/REPORT.md` |
 
 ### 🤖 Gemini-Powered Evaluation (Hermes-inspired)
 
@@ -265,11 +327,18 @@ scripts/
 ├── state-arc-analyzer.py             # User state arc analysis (Phase 2D)
 ├── replay_gate.py                    # Phase 4D: replay validation gate for drafts (skeleton)
 ├── cross_session_cluster.py          # Phase 4E: 14-day pattern mining → proactive proposals
+├── curator.py                        # Track 4: CLI dispatch (--bootstrap/--status/--tick/--pin/--unpin/--restore/--llm-review)
+├── curator_telemetry.py              # Track 4: skill-usage.json read/write + frontmatter helpers (atomic, fcntl-locked)
+├── curator_lifecycle.py              # Track 4: deterministic state machine + archive/restore/pin
+├── curator_llm.py                    # Track 4: Gemini consolidation review + report renderer + cadence gate
+├── curator_actions.py                # Track 4: consolidation/archive executors (concat-merge, no LLM rewrite)
+├── curator_migrate_frontmatter.py    # Track 4: one-time SKILL.md frontmatter migration (idempotent)
 ├── prompts/                          # Pluggable prompt versions
 │   ├── v1_baseline.py                #   Original prompt (baseline)
 │   ├── v2_recall_dedup.py            #   Recall + dedup improvements
 │   ├── v3_balanced.py                #   Production prompt (88.9/100) — now with A.4 rejection ctx + B.4 nomination block
-│   └── v4_rich_transcript.py         #   Phase 4C: rich transcript + turn citations (opt-in)
+│   ├── v4_rich_transcript.py         #   Phase 4C: rich transcript + turn citations (opt-in)
+│   └── curator_v1.py                 #   Track 4: skill consolidation review prompt
 ├── test-cases/                       # Labeled test dataset (18 cases)
 │   ├── should-extract/               #   Ground truth = YES (8 cases)
 │   ├── should-reject/                #   Ground truth = NO (6 cases)
@@ -282,6 +351,7 @@ ai.openclaw.skill-learner.plist       # launchd: batch evaluator (3:30 AM)
 ai.openclaw.skill-learner-server.plist # launchd: real-time server (persistent)
 ai.openclaw.skill-evolution-cron.plist # launchd: batch evolution (4:30 AM)
 ai.openclaw.user-modeling-cron.plist  # launchd: weekly user modeling (Mon 5:00 AM)
+ai.openclaw.skill-curator-cron.plist  # launchd: daily curator tick (5:30 AM, Track 4)
 ```
 
 ### Runtime Data (auto-created)
@@ -298,6 +368,9 @@ ai.openclaw.user-modeling-cron.plist  # launchd: weekly user modeling (Mon 5:00 
 │   ├── correction-signals.json # Track 2 correction log
 │   ├── tool-usage-stats.json   # Daily tool usage statistics
 │   ├── memory-health.json      # Latest memory health check
+│   ├── skill-usage.json        # Track 4: per-skill counters + state (read/applied/patch + active/stale/archived)
+│   ├── curator-reports/        # Track 4: per-run curator reports (run.json + REPORT.md), `latest` symlink
+│   ├── curator.log             # curator cron output
 │   ├── server.log              # evaluate-server log
 │   └── evaluate.log            # Batch evaluator log
 └── skills/                     # Git-tracked (darwin ratchet)
@@ -308,11 +381,28 @@ ai.openclaw.user-modeling-cron.plist  # launchd: weekly user modeling (Mon 5:00 
     │   │   ├── .eval.json      # Structured Gemini evaluation (for card display)
     │   │   └── .replay.json    # Phase D: replay verdict (when gate is active)
     │   └── .pending-review.json
+    ├── _archived/              # Track 4: curator-archived skills (recoverable via `--restore`)
+    │   └── {skill-name}-{YYYY-MM-DD}/
     └── {existing-skill}/       # Approved skills (git-tracked)
-        ├── SKILL.md            # Evolved by Track 1
+        ├── SKILL.md            # Evolved by Track 1; Track 4 added pinned/source/created_at to frontmatter
         ├── test-prompts.json   # Auto-generated test prompts for evolution
         ├── .update-proposal.md # Update patch (if session found improvements)
         └── .eval.json          # Structured update evaluation
+```
+
+**SKILL.md frontmatter shape** (after Track 4 migration):
+
+```yaml
+---
+name: x-tweet-fetcher
+description: ...
+version: 1.0.0
+tags: [twitter, web-fetch]
+# Curator fields (added 2026-04-30 — required by Darwin/Curator)
+pinned: false
+source: user_created          # auto_learned | user_created | self_nominated
+created_at: 2026-04-15
+---
 ```
 
 ---
@@ -485,6 +575,19 @@ Plugin SDK already provides everything needed; no OpenClaw upstream PR required:
 - [x] **B.1 `skill_learner_nominate` first-class tool** via `api.registerTool()` — agent calls directly, payload carries `_firstClass: true`
 - [x] **C.1.b `after_tool_call.params` full pass-through** — plugin `sanitizeParams` + `appendToolTrace` ring buffer (cap 40)
 - [x] **C.1.c `sub_agent_spawned/ended` hooks** — plugin builds parent↔child runId map; child summaries forward to parent `agent_end` payload
+
+### Done — Phase 4.2 Track 4 Skill Curator (2026-04-30)
+Borrowed from Hermes Agent Curator, localized to OpenClaw. Closes the "skills only ever go in" gap:
+- [x] **Per-skill telemetry** — plugin/index.js increments `read_count`/`applied_count`/`patch_count` in `skill-usage.json`; serialized via in-process Promise chain + atomic `tmp + rename`
+- [x] **Frontmatter migration** — every SKILL.md gained `pinned/source/created_at`; bootstrap seeds `created_at` from git-log first-add commit; `remote-agent-revive` + `绕过登录墙的人物语料调研` (lacked frontmatter) get a synthesized minimal block
+- [x] **Deterministic state machine** — active→stale→archived via `apply-based` thresholds (30d-no-apply for never-applied auto, 60d-no-apply otherwise, 30d-stale → archive)
+- [x] **Pin protection** — `pinned: true` in frontmatter blocks Curator state machine, Curator LLM review, and Darwin `validate_skill`. Darwin Gemini prompt now mandates preserving curator fields, with post-write `_missing_curator_fields` guard auto-reverting if any are dropped
+- [x] **LLM consolidation review** — `curator_llm.run_review()` calls Gemini with hard rules (no archive if `applied>3`, no cross-source merge); validator drops invalid recs; outputs `curator-reports/<ts>/{run.json, REPORT.md}` + `latest` symlink
+- [x] **Conservative consolidation executor** — `apply_consolidation` concatenates source SKILL.md bodies under a merge note (no LLM rewriting at approve time), archives sources, single git commit
+- [x] **HTTP routes** — `evaluate-server.py` `GET /curator/status` + `POST /curator/{tick,run,pin,unpin,restore}`; Feishu card with per-rec 采纳/忽略 buttons (`curator_approve||<base64-rec-id>||<run-ts>`)
+- [x] **CLI verbs** — `skill_action.py` adds `pin`/`unpin`/`restore`/`curator_approve`/`curator_reject`; `do_approve` now stamps `source: auto_learned` + `created_at` on promotion
+- [x] **launchd cron** — `ai.openclaw.skill-curator-cron.plist` runs `curator.py --tick` daily at 05:30 (1h after Darwin's 04:30); `--llm-review-if-due` fires from inside tick on a 14d cadence
+- [x] **Detailed plan** — see `~/.claude/plans/hermes-agent-curator-cryptic-fog.md`
 
 ### Still in flight (non-SDK reasons)
 - [ ] **C.1.a `skill_considered_rejected`** — task handed to Jarvis (OpenClaw side), AGENTS.md §六 protocol + weekly-review `[考虑未用]` backfill. See `docs/PHASE_4_1_C1A_AGENT_PROTOCOL_TASK.md`. Data density review after 1 week → decide whether to escalate to a plugin tool
